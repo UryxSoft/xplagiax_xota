@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════════════════════════════
+# XplagiaX TextAnalyzer Microservice — Production Dependencies
+# ═══════════════════════════════════════════════════════════════
+#
+# Two profiles:
+#   SLIM  (<150MB) — CPU-only, Tier 1 perplexity, no ModernBERT
+#   FULL  (~2.5GB) — GPU/CPU, all models, full pipeline
+#
+# This file is the FULL profile.  For SLIM, comment out the
+# torch/transformers/sentencepiece section.
+# ═══════════════════════════════════════════════════════════════
+
+# ── Core Flask ────────────────────────────────────────────────
+flask==3.1.1
+gunicorn==23.0.0
+gevent==24.11.1
+flask-caching==2.3.1
+flask-compress==1.17
+
+# ── Async task queue (optional) ───────────────────────────────
+celery[redis]==5.4.0
+
+# ── XplagiaX Engine — ML/NLP ─────────────────────────────────
+# ModernBERT ensemble (detector_final.py)
+torch>=2.1.0
+transformers>=4.40.0
+tokenizers>=0.15.0
+
+# Perplexity profiler (Tier 1 + Tier 2)
+numpy>=1.26.0
+scipy>=1.12.0
+
+# Stylometric + forensic reports
+matplotlib>=3.8.0
+
+# Reference validator
+requests>=2.31.0
+
+# ── Lightweight NLP ───────────────────────────────────────────
+nltk==3.9.1
+langdetect==1.0.9
+textblob==0.18.0.post0
+
+# ── Utilities ─────────────────────────────────────────────────
+python-dotenv==1.1.0
+
