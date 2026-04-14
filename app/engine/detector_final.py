@@ -1,4 +1,7 @@
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError:
+    gr = None
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 import re
@@ -7,7 +10,10 @@ from typing import Dict, Optional, Tuple
 from tokenizers import normalizers
 from tokenizers.normalizers import Sequence, Replace, Strip, NFKC
 from tokenizers import Regex
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
