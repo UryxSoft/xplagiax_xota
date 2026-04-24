@@ -18,12 +18,33 @@ Files in this directory:
     reasoning_profiler.py       Reasoning-model detection
     watermark_decoder.py        Digital watermark detection
 """
-
+ 
 import os
 import sys
-
-# Add this directory to sys.path so XplagiaX modules can import
-# each other with their original `from detector_final import ...` style.
+ 
+# ── 1. Add engine dir to sys.path ─────────────────────────────
 _ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
+ 
+# ── 2. Ensure transformers sees torch as available ────────────
+# transformers >=4.48 has a lazy-loader that checks is_torch_available()
+# via BACKENDS_MAPPING at attribute-access time.  With torch 2.2.2 the
+# stdlib version check is fine (_torch_available is True), but we
+# reinforce the guard so reloads under Werkzeug can't hit a stale state.
+# NOTE: do NOT fake get_torch_version() — code in utils/generic.py uses
+# that function to gate torch 2.2+ features; lying about the version
+# would cause AttributeErrors when it tries to use 2.4+ APIs on 2.2.2.
+try:
+    import torch  # noqa
+    import transformers.utils.import_utils as _tiu
+    # Force is_torch_available to always return True
+    _tiu.is_torch_available = lambda: True
+    if hasattr(_tiu, "_torch_available"):
+        _tiu._torch_available = True
+    # Patch BACKENDS_MAPPING so lazy attribute access never blocks on torch
+    if hasattr(_tiu, "BACKENDS_MAPPING") and "torch" in _tiu.BACKENDS_MAPPING:
+        original = _tiu.BACKENDS_MAPPING["torch"]
+        _tiu.BACKENDS_MAPPING["torch"] = (lambda: True, original[1])
+except Exception:
+    pass

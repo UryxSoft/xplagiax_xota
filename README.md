@@ -1,134 +1,80 @@
-# TextAnalyzer Microservice
+# XplagiaX — AI Detection Microservice
 
-High-performance Flask microservice for modular text analysis with a plugin architecture.
+Flask microservice for AI-generated text detection. Built around a 4-model ModernBERT ensemble with a modular plugin architecture. Supports per-document segmentation, forensic reports, perplexity analysis, citation verification, and more.
+
+---
 
 ## Architecture
 
 ```
-Client (Flask app)
+Client
     │
-    │  POST /analyze {"text": "...", "plugins": ["sentiment", "keyphrases"]}
+    │  POST /analyze          {"text": "...", "plugins": ["ai_detection", ...]}
+    │  POST /analyze_document {"text": "...", "plugins": ["ai_detection", ...]}
     ▼
-┌─────────────────────────────────────────────────────┐
-│  Gunicorn (--preload + gevent)                      │
-│  ┌───────────────────────────────────────────────┐  │
-│  │  Master Process                               │  │
-│  │  ├── Models loaded ONCE at module level       │  │
-│  │  ├── PluginRegistry auto-discovers plugins    │  │
-│  │  └── create_app() called once                 │  │
-│  └───────────┬───────────┬───────────────────────┘  │
-│         fork │      fork │      (Linux CoW)         │
-│  ┌───────────▼┐  ┌──────▼──────┐                    │
-│  │  Worker 1  │  │  Worker 2   │  ... Worker N      │
-│  │  ~50MB RAM │  │  ~50MB RAM  │  (shared models)   │
-│  └────────────┘  └─────────────┘                    │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  Gunicorn (preload_app=True + gevent workers)                  │
+│                                                                │
+│  Master Process                                                │
+│  ├── ModernBERT ensemble loaded ONCE at module level           │
+│  ├── PluginRegistry auto-discovers all plugins                 │
+│  └── create_app() called once                                  │
+│                  │ fork (Linux CoW)                            │
+│  ┌───────────────▼──┐  ┌──────────────────┐                   │
+│  │    Worker 1       │  │    Worker 2  ...  │                  │
+│  │  ~50 MB overhead  │  │  ~50 MB overhead  │                  │
+│  └───────────────────┘  └───────────────────┘                  │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Design Decisions
+**Key design decisions**
 
 | Decision | Rationale |
-|----------|-----------|
-| `gunicorn --preload` | Load models once in master, share via CoW across workers |
-| `gevent` worker class | Async I/O for thousands of concurrent connections |
-| Module-level model loading | Ensures models live in master's memory before fork |
-| `OMP_NUM_THREADS=1` | Prevents numpy/torch from spawning N threads per worker |
-| Plugin auto-discovery | Add a file in `app/plugins/`, restart — zero core changes |
-| Multi-stage Docker build | Builder installs gcc/dev headers, runtime copies only binaries |
-| Non-root container user | K8s security best practice (UID 1000) |
+|---|---|
+| `preload_app = True` | Models loaded once in master, shared across workers via CoW |
+| `gevent` worker class | Cooperative I/O concurrency, handles hundreds of connections per worker |
+| `OMP_NUM_THREADS=1` | Prevents torch/numpy from spawning per-worker thread explosions |
+| `local_files_only=True` | No HuggingFace network calls on startup — uses local cache |
+| Plugin auto-discovery | Drop a file in `app/plugins/`, restart — zero core changes needed |
+| Multi-stage Docker build | Builder has gcc/dev headers; runtime image is lean |
+| Non-root container user | UID 1000, K8s security best practice |
 
-## Included Plugins
+---
 
-| Plugin | Library | Size | Description |
-|--------|---------|------|-------------|
-| `word_stats` | Pure Python | 0 MB | Word/sentence/paragraph counts, lexical diversity |
-| `sentiment` | TextBlob | ~2 MB | Polarity and subjectivity analysis |
-| `keyphrases` | YAKE | ~1 MB | Unsupervised keyphrase extraction |
-| `summarization` | NLTK | ~5 MB | Extractive TF-IDF sentence ranking |
-| `readability` | Pure Python | 0 MB | Flesch-Kincaid, Fog, Coleman-Liau, ARI |
-| `language_detect` | langdetect | ~1 MB | Language identification |
+## Engine — ModernBERT Ensemble
 
-## Quick Start
+The core classifier (`app/engine/detector_final.py`) loads three fine-tuned ModernBERT models at startup and averages their softmax outputs:
 
-### Local Development
+| File | Labels | Role |
+|---|---|---|
+| `modernbert.bin` | 41 classes | Base ensemble member |
+| `Model_groups_3class_seed12` | 41 classes | Ensemble member (seed 12) |
+| `Model_groups_3class_seed22` | 41 classes | Ensemble member (seed 22) |
 
-```bash
-pip install -r requirements.txt
-python app.py
-```
+The 41 label classes include `human` (index 24) and 40 known AI generators (GPT-4, GPT-4o, Claude variants, LLaMA 3, Mixtral, Gemma, etc.). The binary Human/AI split is derived from `prob[24]` vs the sum of all remaining probabilities.
 
-### Docker Build & Run
+The tokenizer and config are loaded from the local HuggingFace cache (`answerdotai/ModernBERT-base`, `local_files_only=True`).
 
-```bash
-# Build (with BuildKit for layer caching)
-DOCKER_BUILDKIT=1 docker build -t textanalyzer:latest .
+---
 
-# Run with resource limits
-docker run -d \
-  --name textanalyzer \
-  --memory=512m \
-  --cpus=2 \
-  -p 5000:5000 \
-  -e WEB_CONCURRENCY=4 \
-  -e LOG_LEVEL=info \
-  textanalyzer:latest
-```
+## Plugins
 
-### Docker Compose (with Redis for Celery)
+### Available plugins
 
-```yaml
-services:
-  analyzer:
-    build: .
-    ports: ["5000:5000"]
-    environment:
-      WEB_CONCURRENCY: "4"
-      CELERY_BROKER_URL: "redis://redis:6379/0"
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-          cpus: "2.0"
+| Plugin name | Description |
+|---|---|
+| `ai_detection` | Binary Human/AI classification — 4-model ModernBERT ensemble. ~2s CPU, ~0.3s GPU. |
+| `segment_analysis` | Per-paragraph AI/Human heatmap via `HybridSegmentAnalyzer`. Returns preview (80 chars) per segment. |
+| `perplexity_check` | Text predictability analysis via n-gram proxy (Tier 1, CPU) + optional GPT-2 (Tier 2, GPU). |
+| `stylometric_analysis` | Detailed analysis of writing style: sentence structure, vocabulary richness, and burstiness. |
+| `hallucination_check` | Detects AI fabrication risk: internal inconsistencies and factual drift. |
+| `reasoning_check` | Detects reasoning-model signals (o1, DeepSeek-R1): CoT markers and causal density. |
+| `citation_check` | Verifies citations against CrossRef, Semantic Scholar, and OpenAlex. Detects fabricated references. |
+| `watermark_detection` | Detects statistical watermarks embedded in text by AI models. |
+| `forensic_report` | Generates a full HTML forensic report via `ForensicReportGenerator`. Requires `full_analysis` pipeline. |
+| `full_analysis` | Complete pipeline: detection → stylometric → hallucination → reasoning → perplexity → segment → citation → watermark → forensic report. |
 
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
-```
-
-## API Usage
-
-### POST /analyze
-
-```bash
-curl -X POST http://localhost:5000/analyze \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "The rapid integration of Artificial Intelligence in academic settings has sparked a profound ethical debate.",
-    "plugins": ["sentiment", "keyphrases", "word_stats", "readability"]
-  }'
-```
-
-### GET /health (liveness probe)
-
-```bash
-curl http://localhost:5000/health
-# {"status": "healthy"}
-```
-
-### GET /ready (readiness probe)
-
-```bash
-curl http://localhost:5000/ready
-# {"status": "ready", "plugins_loaded": 6, "plugins": [...]}
-```
-
-### GET /plugins (catalogue)
-
-```bash
-curl http://localhost:5000/plugins
-```
-
-## Adding a New Plugin
+### Adding a new plugin
 
 1. Create `app/plugins/my_plugin.py`:
 
@@ -144,12 +90,581 @@ class MyPlugin(BasePlugin):
         return "Does something useful with text."
 
     def analyze(self, text: str) -> dict:
-        # Your analysis logic here
         return {"result": "..."}
 ```
 
-2. Add any new dependencies to `requirements.txt`.
-3. Restart the service. The plugin is auto-discovered — no other changes needed.
+2. Add dependencies to `requirements.txt` if needed.
+3. Restart the service — the plugin is auto-discovered with no other changes.
+
+---
+
+## API
+
+### POST /analyze
+
+Run any combination of plugins on a text.
+
+**Request**
+```json
+{
+    "text": "The rapid integration of AI in academic settings...",
+    "plugins": ["ai_detection", "perplexity_check"]
+}
+```
+
+**Response**
+```json
+{
+    "status": "ok",
+    "word_count": 124,
+    "plugins_requested": ["ai_detection", "perplexity_check"],
+    "results": {
+        "ai_detection": {
+            "status": "ok",
+            "elapsed_ms": 1823.4,
+            "data": {
+                "prediction": "AI",
+                "confidence": 87.32,
+                "human_percentage": 12.68,
+                "ai_percentage": 87.32,
+                "detected_model": "gpt4o",
+                "uncertainty_zone": false,
+                "raw_scores": {"human": 12.68, "ai": 87.32}
+            }
+        },
+        "perplexity_check": {
+            "status": "ok",
+            "elapsed_ms": 340.1,
+            "data": { "ai_score": 74.5, "risk_level": "HIGH", "tier": "tier1" }
+        }
+    },
+    "total_elapsed_ms": 2165.3
+}
+```
+
+```bash
+curl -X POST http://localhost:5006/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Your text here...", "plugins": ["ai_detection"]}'
+```
+
+---
+
+### POST /analyze_document
+
+Run any combination of plugins on a long document **and** get per-paragraph segment scores. Runs all requested plugins through the same registry as `/analyze`, then always appends per-segment results from `HybridSegmentAnalyzer` into the `ai_detection` result (if `ai_detection` was requested).
+
+**Request**
+```json
+{
+    "text": "Long document text...",
+    "plugins": ["ai_detection"]
+}
+```
+
+`plugins` is optional — defaults to `["ai_detection"]`.
+
+**Response**
+```json
+{
+    "status": "ok",
+    "word_count": 620,
+    "plugins_requested": ["ai_detection"],
+    "results": {
+        "ai_detection": {
+            "status": "ok",
+            "elapsed_ms": 2041.7,
+            "data": {
+                "prediction": "AI",
+                "confidence": 90.67,
+                "human_percentage": 9.33,
+                "ai_percentage": 90.67,
+                "detected_model": "gpt4",
+                "uncertainty_zone": false,
+                "raw_scores": {"human": 9.33, "ai": 90.67},
+                "segments": [
+                    {
+                        "segment_id": 1,
+                        "text": "Full paragraph text here...",
+                        "dominant_label": "AI",
+                        "score": 90.6663,
+                        "forensic_analysis": {}
+                    },
+                    {
+                        "segment_id": 2,
+                        "text": "Another paragraph...",
+                        "dominant_label": "Human",
+                        "score": 82.14,
+                        "forensic_analysis": {}
+                    }
+                ]
+            }
+        }
+    },
+    "total_elapsed_ms": 5987.2
+}
+```
+
+```bash
+# Default — ai_detection + segments
+curl -X POST http://localhost:5006/analyze_document \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Long document text..."}'
+
+# Multiple plugins — all run, segments injected into ai_detection
+curl -X POST http://localhost:5006/analyze_document \
+  -H "Content-Type: application/json" \
+  -d '{"text": "...", "plugins": ["ai_detection", "perplexity_check", "citation_check"]}'
+```
+
+---
+
+### GET /health
+
+Liveness probe — always 200 if the process is alive.
+
+```bash
+curl http://localhost:5006/health
+# {"status": "healthy"}
+```
+
+---
+
+### GET /ready
+
+Readiness probe — 200 only when plugins are loaded.
+
+```bash
+curl http://localhost:5006/ready
+# {"status": "ready", "plugins_loaded": 6, "plugins": [...]}
+```
+
+---
+
+### GET /plugins
+
+List all registered plugins with descriptions.
+
+```bash
+curl http://localhost:5006/plugins
+```
+
+---
+
+### GET /report/\<filename\>
+
+Serve a generated HTML forensic report from `/tmp`.
+
+```bash
+curl http://localhost:5006/report/forensic_abc123.html
+```
+
+---
+
+## Usage Examples
+
+All examples assume the server is running on `http://localhost:5006`.
+
+---
+
+### curl
+
+#### Detect AI in a short text
+```bash
+curl -X POST http://localhost:5006/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "The rapid integration of artificial intelligence in academic settings has sparked a profound ethical debate. Institutions worldwide are grappling with questions of authenticity, intellectual integrity, and the boundaries of acceptable AI assistance.",
+    "plugins": ["ai_detection"]
+  }'
+```
+
+#### Run multiple plugins at once
+```bash
+curl -X POST http://localhost:5006/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Your text here...",
+    "plugins": ["ai_detection", "perplexity_check", "citation_check"]
+  }'
+```
+
+#### Analyze a full document with per-segment breakdown
+```bash
+curl -X POST http://localhost:5006/analyze_document \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "First paragraph of the document. It introduces the topic and sets the context for subsequent discussion.\n\nSecond paragraph provides supporting evidence and examples drawn from recent literature.\n\nThe conclusion synthesizes the findings and proposes directions for future research.",
+    "plugins": ["ai_detection"]
+  }'
+```
+
+#### Full forensic pipeline
+```bash
+curl -X POST http://localhost:5006/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Your text here...",
+    "plugins": ["full_analysis"]
+  }'
+```
+
+#### Check readiness before sending requests
+```bash
+curl -s http://localhost:5006/ready | python3 -m json.tool
+```
+
+#### List all available plugins
+```bash
+curl -s http://localhost:5006/plugins | python3 -m json.tool
+```
+
+---
+
+### Python — `requests`
+
+#### Basic AI detection
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:5006/analyze",
+    json={
+        "text": (
+            "The rapid integration of artificial intelligence in academic settings "
+            "has sparked a profound ethical debate. Institutions worldwide are "
+            "grappling with questions of authenticity and intellectual integrity."
+        ),
+        "plugins": ["ai_detection"],
+    },
+)
+data = response.json()
+
+result = data["results"]["ai_detection"]["data"]
+print(f"Prediction:  {result['prediction']}")
+print(f"Confidence:  {result['confidence']:.2f}%")
+print(f"Human:       {result['human_percentage']:.2f}%")
+print(f"AI:          {result['ai_percentage']:.2f}%")
+print(f"Model hint:  {result['detected_model']}")
+print(f"Uncertain:   {result['uncertainty_zone']}")
+```
+
+#### Analyze document with segments
+```python
+import requests
+
+text = """
+The emergence of large language models has fundamentally changed the way
+humans interact with information systems.
+
+These models, trained on billions of tokens, demonstrate remarkable fluency
+across domains ranging from legal analysis to creative writing.
+
+However, the implications for education and academic integrity remain
+a subject of active debate among researchers and institutional policymakers.
+"""
+
+response = requests.post(
+    "http://localhost:5006/analyze_document",
+    json={
+        "text": text,
+        "plugins": ["ai_detection"],
+    },
+)
+data = response.json()
+
+ai = data["results"]["ai_detection"]["data"]
+print(f"Global prediction: {ai['prediction']} ({ai['confidence']:.2f}%)")
+print(f"Segments analyzed: {len(ai.get('segments', []))}")
+
+for seg in ai.get("segments", []):
+    print(f"  [{seg['segment_id']}] {seg['dominant_label']:7s}  {seg['score']:.2f}%  {seg['text'][:60]}...")
+```
+
+#### Run multiple plugins and handle errors
+```python
+import requests
+
+def analyze(text: str, plugins: list[str], base_url: str = "http://localhost:5006") -> dict:
+    resp = requests.post(
+        f"{base_url}/analyze",
+        json={"text": text, "plugins": plugins},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+result = analyze(
+    text="Your text here...",
+    plugins=["ai_detection", "perplexity_check"],
+)
+
+for plugin_name, plugin_result in result["results"].items():
+    if plugin_result["status"] == "ok":
+        print(f"{plugin_name}: {plugin_result['data']}")
+    else:
+        print(f"{plugin_name}: ERROR — {plugin_result.get('error')}")
+```
+
+#### Check server readiness before running inference
+```python
+import requests
+import time
+
+def wait_for_ready(base_url: str = "http://localhost:5006", retries: int = 10):
+    for attempt in range(retries):
+        try:
+            r = requests.get(f"{base_url}/ready", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                print(f"Server ready — {data['plugins_loaded']} plugins loaded")
+                return True
+        except requests.ConnectionError:
+            pass
+        print(f"Not ready yet, retrying ({attempt + 1}/{retries})...")
+        time.sleep(5)
+    raise RuntimeError("Server did not become ready in time")
+
+wait_for_ready()
+```
+
+---
+
+### Python — `httpx` (async)
+
+```python
+import asyncio
+import httpx
+
+async def analyze_async(text: str, plugins: list[str]) -> dict:
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            "http://localhost:5006/analyze",
+            json={"text": text, "plugins": plugins},
+        )
+        response.raise_for_status()
+        return response.json()
+
+async def main():
+    texts = [
+        "First document to analyze...",
+        "Second document to analyze...",
+        "Third document to analyze...",
+    ]
+
+    tasks = [
+        analyze_async(text, ["ai_detection"])
+        for text in texts
+    ]
+    results = await asyncio.gather(*tasks)
+
+    for i, result in enumerate(results):
+        ai = result["results"]["ai_detection"]["data"]
+        print(f"Doc {i+1}: {ai['prediction']}  {ai['confidence']:.2f}%")
+
+asyncio.run(main())
+```
+
+---
+
+### JavaScript / Node.js — `fetch`
+
+```js
+const BASE_URL = "http://localhost:5006";
+
+async function analyzeText(text, plugins = ["ai_detection"]) {
+  const response = await fetch(`${BASE_URL}/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, plugins }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+  }
+  return response.json();
+}
+
+async function analyzeDocument(text, plugins = ["ai_detection"]) {
+  const response = await fetch(`${BASE_URL}/analyze_document`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, plugins }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+  }
+  return response.json();
+}
+
+// Usage
+const text = `The integration of AI in academic settings has sparked debate.
+Second paragraph with more context about the subject matter.`;
+
+// Single plugin
+const result = await analyzeText(text, ["ai_detection"]);
+const ai = result.results.ai_detection.data;
+console.log(`${ai.prediction} — ${ai.confidence.toFixed(2)}%`);
+
+// Document with segments
+const docResult = await analyzeDocument(text);
+const segments = docResult.results.ai_detection.data.segments ?? [];
+segments.forEach(seg => {
+  console.log(`[${seg.segment_id}] ${seg.dominant_label} ${seg.score.toFixed(2)}% — ${seg.text.slice(0, 60)}...`);
+});
+```
+
+---
+
+### Error responses
+
+All endpoints return a JSON error body with an appropriate HTTP status code.
+
+| Status | Cause | Body |
+|---|---|---|
+| `400` | Missing or invalid `text` field | `{"error": "'text' field is required and must be a non-empty string"}` |
+| `400` | Invalid JSON body | `{"error": "Invalid JSON body"}` |
+| `400` | `plugins` is not a non-empty list | `{"error": "'plugins' must be a non-empty list"}` |
+| `415` | Missing `Content-Type: application/json` | `{"error": "Content-Type must be application/json"}` |
+| `503` | `ai_detection` plugin not loaded | `{"error": "ai_detection plugin not available"}` |
+
+When a plugin runs but fails internally, the response is still `200` and the individual plugin entry will have `"status": "error"`:
+
+```json
+{
+    "status": "ok",
+    "results": {
+        "ai_detection": {
+            "status": "error",
+            "error": "ModernBERT models not loaded. Check model paths.",
+            "elapsed_ms": 0.3
+        }
+    }
+}
+```
+
+---
+
+## Quick Start
+
+### Local development
+
+```bash
+# 1. Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate       # Windows: .venv\Scripts\activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Place model files in app/engine/
+#    app/engine/modernbert.bin
+#    app/engine/Model_groups_3class_seed12
+#    app/engine/Model_groups_3class_seed22
+
+# 4. Ensure the ModernBERT tokenizer is cached locally
+python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('answerdotai/ModernBERT-base')"
+
+# 5. Start the dev server
+python app.py
+```
+
+### Production (gunicorn)
+
+```bash
+gunicorn --preload -c gunicorn.conf.py "app:create_app()"
+```
+
+### Docker
+
+```bash
+# Build
+DOCKER_BUILDKIT=1 docker build -t xplagiax:latest .
+
+# Run
+docker run -d \
+  --name xplagiax \
+  --memory=4g \
+  --cpus=4 \
+  -p 5006:5006 \
+  -v /path/to/models:/app/app/engine \
+  -e WEB_CONCURRENCY=2 \
+  -e LOG_LEVEL=info \
+  xplagiax:latest
+```
+
+> The three model weight files (~600 MB each, ~1.8 GB total) are mounted via volume. They are not baked into the image.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEB_CONCURRENCY` | `2×CPU (max 8)` | Number of gunicorn workers |
+| `GUNICORN_TIMEOUT` | `120` | Hard worker kill timeout (seconds) |
+| `GRACEFUL_TIMEOUT` | `30` | Soft shutdown window (seconds) |
+| `MAX_CONTENT_MB` | `16` | Max request body size in MB |
+| `LOG_LEVEL` | `info` | Logging verbosity (`debug`, `info`, `warning`, `error`) |
+| `PLUGIN_TIMEOUT` | `30` | Max seconds per plugin execution |
+| `PERPLEXITY_TIER2` | `1` | Enable GPT-2 Tier 2 perplexity (`0` to disable) |
+| `PERPLEXITY_DICT_PATH` | _(none)_ | Path to custom n-gram frequency dictionary |
+| `REFERENCE_NETWORK` | `1` | Enable live citation network calls (`0` to disable) |
+| `ENABLE_REFERENCE_CHECK` | `0` | Include citation check in `full_analysis` pipeline |
+| `ENABLE_WATERMARK` | `0` | Include watermark detection in `full_analysis` pipeline |
+| `CACHE_TYPE` | `SimpleCache` | Flask-Caching backend |
+| `CACHE_TIMEOUT` | `300` | Cache TTL in seconds |
+| `CELERY_BROKER_URL` | `redis://localhost:6379/0` | Celery broker URL (optional async queue) |
+
+---
+
+## Project Structure
+
+```
+xplagiax_xota/
+├── app.py                        # Entry point — gunicorn target
+├── gunicorn.conf.py              # Production server config
+├── requirements.txt              # Python dependencies
+├── Dockerfile                    # Multi-stage container build
+│
+├── app/
+│   ├── __init__.py               # create_app() factory
+│   ├── config.py                 # All config via env vars
+│   ├── routes.py                 # API blueprints (/analyze, /analyze_document, ...)
+│   ├── plugin_registry.py        # Auto-discovery and dispatch
+│   │
+│   ├── plugins/
+│   │   ├── base.py               # BasePlugin interface
+│   │   ├── ai_detection.py       # Binary AI/Human classification
+│   │   ├── segment_analysis.py   # Per-paragraph heatmap (preview)
+│   │   ├── perplexity_check.py   # Text predictability analysis
+│   │   ├── stylometric_analysis.py # Writing style fingerprinting
+│   │   ├── hallucination_check.py # AI fabrication risk detection
+│   │   ├── reasoning_check.py     # Reasoning-model detection (o1/R1)
+│   │   ├── citation_check.py     # Reference existence verification
+│   │   ├── watermark_detection.py # Digital watermark detection
+│   │   ├── forensic_report.py    # HTML forensic report generation
+│   │   └── full_analysis.py      # Complete forensic pipeline
+│   │
+│   └── engine/                   # XplagiaX core — unmodified engine files
+│       ├── __init__.py           # sys.path setup + torch/transformers patch
+│       ├── detector_final.py     # 4-model ModernBERT ensemble
+│       ├── hybrid_segment_detector.py   # Sliding-window segment classifier
+│       ├── perplexity_profiler.py       # n-gram + GPT-2 perplexity
+│       ├── stylometric_profiler.py      # Writing style fingerprinting
+│       ├── hallucination_profile.py     # Fabrication risk detection
+│       ├── reasoning_profiler.py        # Reasoning-model detection
+│       ├── reference_validator.py       # Citation verification
+│       ├── watermark_decoder.py         # Digital watermark detection
+│       ├── forensic_reports.py          # HTML/JSON report generator (v3.9)
+│       ├── plugin_orchestrator.py       # Full pipeline coordinator
+│       ├── modernbert.bin               # Model weights (~600 MB)
+│       ├── Model_groups_3class_seed12   # Model weights (~600 MB)
+│       └── Model_groups_3class_seed22   # Model weights (~600 MB)
+```
+
+---
 
 ## Kubernetes Deployment
 
@@ -157,49 +672,47 @@ class MyPlugin(BasePlugin):
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: textanalyzer
+  name: xplagiax
 spec:
-  replicas: 3
+  replicas: 2
   template:
     spec:
       containers:
-        - name: analyzer
-          image: textanalyzer:latest
+        - name: xplagiax
+          image: xplagiax:latest
           ports:
-            - containerPort: 5000
+            - containerPort: 5006
           env:
             - name: WEB_CONCURRENCY
-              value: "4"
+              value: "2"
+            - name: LOG_LEVEL
+              value: "info"
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "500m"
+              memory: "3Gi"
+              cpu: "1000m"
             limits:
-              memory: "512Mi"
-              cpu: "2000m"
+              memory: "5Gi"
+              cpu: "4000m"
+          volumeMounts:
+            - name: models
+              mountPath: /app/app/engine
           livenessProbe:
             httpGet:
               path: /health
-              port: 5000
-            initialDelaySeconds: 10
+              port: 5006
+            initialDelaySeconds: 60
             periodSeconds: 30
           readinessProbe:
             httpGet:
               path: /ready
-              port: 5000
-            initialDelaySeconds: 5
+              port: 5006
+            initialDelaySeconds: 30
             periodSeconds: 10
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: xplagiax-models-pvc
 ```
 
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WEB_CONCURRENCY` | `2×CPU (max 8)` | Number of gunicorn workers |
-| `GUNICORN_TIMEOUT` | `120` | Worker timeout in seconds |
-| `MAX_CONTENT_MB` | `16` | Max request body size in MB |
-| `LOG_LEVEL` | `info` | Logging verbosity |
-| `CACHE_TYPE` | `SimpleCache` | Flask-Caching backend |
-| `CACHE_TIMEOUT` | `300` | Cache TTL in seconds |
-| `CELERY_BROKER_URL` | `redis://localhost:6379/0` | Celery broker |
-| `PLUGIN_TIMEOUT` | `30` | Max seconds per plugin execution |
+> `initialDelaySeconds` is set high because the three ModernBERT model files take ~30–60s to load on first startup.

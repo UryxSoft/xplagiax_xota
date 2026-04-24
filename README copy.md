@@ -68,7 +68,7 @@ docker run -d \
   --name textanalyzer \
   --memory=512m \
   --cpus=2 \
-  -p 5000:5000 \
+  -p 5006:5006 \
   -e WEB_CONCURRENCY=4 \
   -e LOG_LEVEL=info \
   textanalyzer:latest
@@ -80,7 +80,7 @@ docker run -d \
 services:
   analyzer:
     build: .
-    ports: ["5000:5000"]
+    ports: ["5006:5006"]
     environment:
       WEB_CONCURRENCY: "4"
       CELERY_BROKER_URL: "redis://redis:6379/0"
@@ -100,7 +100,7 @@ services:
 ### POST /analyze
 
 ```bash
-curl -X POST http://localhost:5000/analyze \
+curl -X POST http://localhost:5006/analyze \
   -H "Content-Type: application/json" \
   -d '{
     "text": "The rapid integration of Artificial Intelligence in academic settings has sparked a profound ethical debate.",
@@ -111,21 +111,21 @@ curl -X POST http://localhost:5000/analyze \
 ### GET /health (liveness probe)
 
 ```bash
-curl http://localhost:5000/health
+curl http://localhost:5006/health
 # {"status": "healthy"}
 ```
 
 ### GET /ready (readiness probe)
 
 ```bash
-curl http://localhost:5000/ready
+curl http://localhost:5006/ready
 # {"status": "ready", "plugins_loaded": 6, "plugins": [...]}
 ```
 
 ### GET /plugins (catalogue)
 
 ```bash
-curl http://localhost:5000/plugins
+curl http://localhost:5006/plugins
 ```
 
 ## Adding a New Plugin
@@ -166,7 +166,7 @@ spec:
         - name: analyzer
           image: textanalyzer:latest
           ports:
-            - containerPort: 5000
+            - containerPort: 5006
           env:
             - name: WEB_CONCURRENCY
               value: "4"
@@ -180,13 +180,13 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 5000
+              port: 5006
             initialDelaySeconds: 10
             periodSeconds: 30
           readinessProbe:
             httpGet:
               path: /ready
-              port: 5000
+              port: 5006
             initialDelaySeconds: 5
             periodSeconds: 10
 ```

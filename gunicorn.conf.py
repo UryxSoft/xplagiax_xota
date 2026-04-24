@@ -17,7 +17,7 @@ import os
 import multiprocessing
 
 # ── Server socket ─────────────────────────────────────────────────
-bind = os.getenv("GUNICORN_BIND", "0.0.0.0:5000")
+bind = os.getenv("GUNICORN_BIND", "0.0.0.0:5006")
 
 # ── Workers ───────────────────────────────────────────────────────
 workers = int(os.getenv("WEB_CONCURRENCY",

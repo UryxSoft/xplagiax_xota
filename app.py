@@ -29,4 +29,4 @@ from app import create_app  # noqa: E402  (after env setup)
 # Dev-only runner — production uses gunicorn
 if __name__ == "__main__":
     application = create_app()
-    application.run(host="0.0.0.0", port=5000, debug=True)
+    application.run(host="0.0.0.0", port=5006, debug=True)

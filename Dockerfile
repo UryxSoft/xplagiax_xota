@@ -46,9 +46,9 @@ COPY --chown=flaskuser:flaskuser app/ ./app/
 RUN mkdir -p /app/models && chown flaskuser:flaskuser /app/models
 
 USER flaskuser
-EXPOSE 5000
+EXPOSE 5006
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5006/health')" || exit 1
 
 CMD ["gunicorn", "-c", "gunicorn.conf.py", "app:create_app()"]

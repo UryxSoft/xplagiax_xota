@@ -1,0 +1,19 @@
+HallucinationProfiler: spaCy unavailable. Entity and syntactic features will be zeros.
+HallucinationProfiler: spaCy unavailable. Entity and syntactic features will be zeros.
+[2026-04-21 21:26:57,697] INFO in __init__: TextAnalyzer ready — 10 plugins: ai_detection, citation_check, forensic_report, full_analysis, hallucination_check, perplexity_check, reasoning_check, segment_analysis, stylometric_analysis, watermark_detection
+ * Serving Flask app 'app'
+ * Debug mode: on
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.149.40:5000
+[33mPress CTRL+C to quit[0m
+ * Restarting with stat
+HallucinationProfiler: spaCy unavailable. Entity and syntactic features will be zeros.
+HallucinationProfiler: spaCy unavailable. Entity and syntactic features will be zeros.
+[2026-04-21 21:27:56,071] INFO in __init__: TextAnalyzer ready — 10 plugins: ai_detection, citation_check, forensic_report, full_analysis, hallucination_check, perplexity_check, reasoning_check, segment_analysis, stylometric_analysis, watermark_detection
+ * Debugger is active!
+ * Debugger PIN: 632-664-958
+127.0.0.1 - - [21/Apr/2026 21:28:21] "GET /plugins HTTP/1.1" 200 -
+/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

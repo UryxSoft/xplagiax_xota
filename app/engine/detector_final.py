@@ -1,9 +1,11 @@
-try:
-    import gradio as gr
-except ImportError:
-    gr = None
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+# ── torch + device must be defined FIRST so _load_model() can always
+# reference the global `device`, even if a later import fails. ──────
 import torch
+import os
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import re
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
@@ -15,30 +17,41 @@ try:
 except ImportError:
     plt = None
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(it, **kwargs):  # type: ignore[misc]
+        return it
 
-model1_path = "/content/modernbert.bin"
-model2_path = "https://huggingface.co/mihalykiss/modernbert_2/resolve/main/Model_groups_3class_seed12"
-model3_path = "https://huggingface.co/mihalykiss/modernbert_2/resolve/main/Model_groups_3class_seed22"
-model4_path = "https://huggingface.co/mihalykiss/ModernBERT-MGT/resolve/main/Model_groups_41class_seed44__new"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
+model1_path = os.path.join(_BASE_DIR, "modernbert.bin")
+model2_path = os.path.join(_BASE_DIR, "Model_groups_3class_seed12")
+model3_path = os.path.join(_BASE_DIR, "Model_groups_3class_seed22")
+#model4_path = os.path.join(_BASE_DIR, "Model_groups_41class_seed44__new")
 
-model_1 = AutoModelForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=41)
-model_1.load_state_dict(torch.load(model1_path, map_location=device))
-model_1.to(device).eval()
+# ── Config + tokenizer: use local cache only to avoid network failures ──
+from transformers import AutoConfig
+_config = AutoConfig.from_pretrained(
+    "answerdotai/ModernBERT-base", num_labels=41, local_files_only=True
+)
+tokenizer = AutoTokenizer.from_pretrained(
+    "answerdotai/ModernBERT-base", local_files_only=True
+)
 
-model_2 = AutoModelForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=41)
-model_2.load_state_dict(torch.hub.load_state_dict_from_url(model2_path, map_location=device))
-model_2.to(device).eval()
+# ── Helper: arquitectura vacía + pesos locales, 0 descargas ──
+def _load_model(weight_path):
+    m = AutoModelForSequenceClassification.from_config(_config)
+    m.load_state_dict(torch.load(weight_path, map_location=device))
+    m.to(device).eval()
+    return m
 
-model_3 = AutoModelForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=41)
-model_3.load_state_dict(torch.hub.load_state_dict_from_url(model3_path, map_location=device))
-model_3.to(device).eval()
-
-model_4 = AutoModelForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=41)
-model_4.load_state_dict(torch.hub.load_state_dict_from_url(model4_path, map_location=device))
-model_4.to(device).eval()
+model_1 = _load_model(model1_path)
+model_2 = _load_model(model2_path)
+model_3 = _load_model(model3_path)
+#model_4 = AutoModelForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=41)
+#model_4.load_state_dict(torch.hub.load_state_dict_from_url(model4_path, map_location=device))
+#model_4.to(device).eval()
 
 
 label_mapping = {
@@ -71,12 +84,12 @@ class DetectionResult:
 
 
 def clean_text(text: str) -> str:
-    text = re.sub(r"\s{2,}", " ", text)
-    text = re.sub(r"\s+([,.;:?!])", r"\1", text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    text = re.sub(r'\s+([,.;:?!])', r'\1', text)
     return text
 
-newline_to_space = Replace(Regex(r"\s*\n\s*"), " ")
-join_hyphen_break = Replace(Regex(r"(\w+)[--]\s*\n\s*(\w+)"), r"\1\2")
+newline_to_space = Replace(Regex(r'\s*\n\s*'), " ")
+join_hyphen_break = Replace(Regex(r'(\w+)[--]\s*\n\s*(\w+)'), r"\1\2")
 tokenizer.backend_tokenizer.normalizer = Sequence([
     tokenizer.backend_tokenizer.normalizer,
     join_hyphen_break,
@@ -88,16 +101,14 @@ tokenizer.backend_tokenizer.normalizer = Sequence([
 # [MODIFIED v1.1] Returns 3-tuple: (result_message, fig, DetectionResult).
 # All inference logic is IDENTICAL to the original.
 
-def classify_text(text: str) -> Tuple[str, Optional[plt.Figure], DetectionResult]:
+def classify_text(text):
+    """
+    Classifies the text and generates a plot of the human vs AI probability.
+    Returns both the result message and the plot figure.
+    """
     cleaned_text = clean_text(text)
     if not cleaned_text.strip():
-        _empty = DetectionResult(
-            prediction="Unknown", confidence=0.0,
-            human_percentage=50.0, ai_percentage=50.0,
-            detected_model=None, raw_scores={"human": 50.0, "ai": 50.0},
-            statistical_features={}, uncertainty_zone=True,
-        )
-        return "", None, _empty
+        return "", None
 
     inputs = tokenizer(cleaned_text, return_tensors="pt", truncation=True, padding=True).to(device)
 
@@ -105,12 +116,12 @@ def classify_text(text: str) -> Tuple[str, Optional[plt.Figure], DetectionResult
         logits_1 = model_1(**inputs).logits
         logits_2 = model_2(**inputs).logits
         logits_3 = model_3(**inputs).logits
-        logits_4 = model_4(**inputs).logits
+
         softmax_1 = torch.softmax(logits_1, dim=1)
         softmax_2 = torch.softmax(logits_2, dim=1)
         softmax_3 = torch.softmax(logits_3, dim=1)
-        softmax_4 = torch.softmax(logits_4, dim=1)
-        averaged_probabilities = (softmax_1 + softmax_2 + softmax_3 + softmax_4) / 4
+
+        averaged_probabilities = (softmax_1 + softmax_2 + softmax_3) / 3
         probabilities = averaged_probabilities[0]
 
     human_prob = probabilities[24].item()
@@ -134,38 +145,40 @@ def classify_text(text: str) -> Tuple[str, Optional[plt.Figure], DetectionResult
             f"**The text is** <span class='highlight-ai'>**{ai_percentage:.2f}%** likely <b>AI generated</b>.</span>\n\n"
         )
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    categories = ["Human", "AI"]
+    fig, ax = plt.subplots(figsize=(8, 4))  # Adjust figure size for better layout
+
+    categories = ['Human', 'AI']
     probabilities_for_plot = [human_percentage, ai_percentage]
-    bars = ax.bar(categories, probabilities_for_plot, color=["#4CAF50", "#FF5733"], alpha=0.8)
-    ax.set_ylabel("Probability (%)", fontsize=12)
-    ax.set_title("Human vs AI Probability", fontsize=14, fontweight="bold")
-    ax.grid(axis="y", linestyle="--", alpha=0.6)
+
+    bars = ax.bar(categories, probabilities_for_plot, color=['#4CAF50', '#FF5733'], alpha=0.8)
+    ax.set_ylabel('Probability (%)', fontsize=12)
+    ax.set_title('Human vs AI Probability', fontsize=14, fontweight='bold')
+    ax.grid(axis='y', linestyle='--', alpha=0.6)
+
+    # Add labels to the bars
     for bar in bars:
         height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2, height + 1, f"{height:.2f}%", ha="center")
-    ax.set_ylim(0, 100)
+        ax.text(bar.get_x() + bar.get_width() / 2, height + 1, f'{height:.2f}%', ha='center')
+
+
+    ax.set_ylim(0, 100) 
     plt.tight_layout()
 
-    raw_scores: Dict[str, float] = {
-        "human": round(human_percentage, 4),
-        "ai":    round(ai_percentage, 4),
-    }
-    for idx, lbl in label_mapping.items():
-        raw_scores[f"class_{lbl}"] = round(float(probabilities[idx].item()) * 100.0, 4)
+    # --- LO QUE FALTABA: Construir el objeto DetectionResult ---
+    human_percentage = round(human_percentage)
+    ai_percentage    = round(ai_percentage)
 
-    detection_result = DetectionResult(
-        prediction        = "AI" if ai_percentage > human_percentage else "Human",
-        confidence        = round(max(human_percentage, ai_percentage), 4),
-        human_percentage  = round(human_percentage, 4),
-        ai_percentage     = round(ai_percentage, 4),
-        detected_model    = ai_argmax_model if ai_percentage > human_percentage else None,
-        raw_scores        = raw_scores,
-        statistical_features = {},
-        uncertainty_zone  = abs(human_percentage - ai_percentage) < 15.0,
+    det_result = DetectionResult(
+        prediction="Human" if human_percentage > ai_percentage else "AI",
+        confidence=round(max(human_percentage, ai_percentage)),
+        human_percentage=human_percentage,
+        ai_percentage=ai_percentage,
+        detected_model=ai_argmax_model if ai_percentage > human_percentage else None,
+        raw_scores={"human": round(human_prob), "ai_total": round(ai_total_prob)}
     )
-    return result_message, fig, detection_result
 
+    # Devolver los 3 elementos exactamente como espera el orquestador
+    return result_message, fig, det_result
 
 # [ADDED v1.1] Gradio wrapper — unpacks only (msg, fig) for Gradio outputs.
 def _gradio_classify(text: str):
@@ -195,13 +208,13 @@ def classify_segment(text: str) -> Tuple[float, float]:
         logits_1 = model_1(**inputs).logits
         logits_2 = model_2(**inputs).logits
         logits_3 = model_3(**inputs).logits
-        logits_4 = model_4(**inputs).logits
+        #logits_4 = model_4(**inputs).logits
         avg_probs = (
             torch.softmax(logits_1, dim=1)
             + torch.softmax(logits_2, dim=1)
             + torch.softmax(logits_3, dim=1)
-            + torch.softmax(logits_4, dim=1)
-        ) / 4
+            #+ torch.softmax(logits_4, dim=1)
+        ) / 3
         probs = avg_probs[0]
 
     human_prob = probs[24].item()
@@ -212,8 +225,265 @@ def classify_segment(text: str) -> Tuple[float, float]:
     total = human_prob + ai_total
     human_pct = (human_prob / total) * 100
     ai_pct = (ai_total / total) * 100
-    return round(human_pct, 4), round(ai_pct, 4)
+    return round(human_pct), round(ai_pct)
 
+
+def validar_veredicto_segmento(segmento_dict: dict) -> dict:
+    """
+    Analiza el forensic_analysis de un segmento para confirmar o descartar
+    si realmente es IA.
+
+    Cambios v1.3 (BUG FIX):
+    ─────────────────────────────────────────────────────────────────────
+    BUG #1 CORREGIDO: El criterio de confirmación por alucinación
+    bibliográfica era incondicional: cualquier fabricated_count >= 1
+    sobreescribía el veredicto a "AI (Confirmed) 100%", incluso cuando
+    el extractor de referencias había capturado texto estructural
+    (headers de sección, alt-text de imágenes) como si fueran citas.
+
+    La corrección agrega tres condiciones de guardia:
+      1. total_references >= 2   → descartar extracciones únicas/espurias
+      2. fabricated_ratio >= 0.70 → al menos 70% de las refs son inválidas
+      3. El modelo base YA marcaba IA (label "AI" y score > 50)
+
+    Esto elimina los falsos positivos sin afectar los verdaderos positivos
+    (textos con múltiples citas inventadas confirmadas).
+    """
+    analisis = segmento_dict.get("forensic_analysis")
+    if not analisis or "error_forense" in analisis:
+        return segmento_dict
+
+    razonamiento = analisis.get("reasoning", {})
+    perplejidad  = analisis.get("perplexity", {})
+    referencias  = analisis.get("reference_check", {})
+
+    # ── 1. CRITERIO DE DESCARTE (Falso Positivo) ──────────────────────────
+    # Si el modelo dice IA, pero no hay indicadores de razonamiento y el texto
+    # tiene una entropía muy alta (humana), es probable que sea un falso positivo.
+    if razonamiento.get("ai_score", 0) < 0.25 and perplejidad.get("ai_score", 0) < 0.40:
+        segmento_dict["dominant_label"] = "Human (Validated)"
+        segmento_dict["score"] = 100 - segmento_dict["score"]
+        segmento_dict["status_note"] = (
+            "Descartado: Los plugins forenses confirman estructura humana natural."
+        )
+
+    # ── 2. CRITERIO DE CONFIRMACIÓN (Alucinación detectada) ───────────────
+    # [FIX v1.3] Condiciones de guardia para evitar falsos positivos
+    # causados por extracción espuria de texto estructural como referencias.
+    #
+    # Condiciones requeridas (TODAS deben cumplirse):
+    #   a) Al menos 2 referencias extraídas (evita falsos positivos
+    #      de una sola extracción sobre texto de sección/imagen)
+    #   b) Ratio de fabricación >= 70% (mayoría clara de citas inválidas)
+    #   c) El modelo base ya sospechaba IA en este segmento
+    #      (label contiene "AI" y score > 50)
+    feat_vals   = referencias.get("feature_values", {})
+    fab_count   = feat_vals.get("fabricated_count", 0)
+    total_refs  = feat_vals.get("total_references", 0)
+    fab_ratio   = feat_vals.get("fabricated_ratio", 0.0)
+    base_score  = segmento_dict.get("score", 0.0)
+    base_label  = segmento_dict.get("dominant_label", "")
+
+    if (
+        fab_count > 0
+        and total_refs >= 2                  # guardia (a): más de una referencia
+        and fab_ratio >= 0.70               # guardia (b): mayoría de citas inválidas
+        and "AI" in base_label              # guardia (c): modelo base ya sospechaba IA
+        and base_score > 50.0              # guardia (c): confianza mínima en IA
+    ):
+        segmento_dict["dominant_label"] = "AI (Confirmed)"
+        segmento_dict["score"] = 100.0
+        segmento_dict["status_note"] = (
+            "Confirmado: Se detectaron alucinaciones bibliográficas (citas inventadas)."
+        )
+
+    return segmento_dict
+
+
+def analyze_long_document(long_text: str, orchestrator=None, max_tokens: int = 512) -> dict:
+    """
+    Analiza un documento completo con segmentación semántica y validación forense.
+    """
+    if not long_text.strip():
+        return {"error": "El documento está vacío."}
+
+    # 1. División semántica
+    if "\n" in long_text:
+        raw_fragments = [p.strip() for p in re.split(r'\n+', long_text) if p.strip()]
+    else:
+        raw_fragments = [p.strip() + "." for p in re.split(r'(?<=\.)\s+', long_text) if p.strip()]
+
+    chunks_text = []
+    current_chunk = ""
+    current_length = 0
+
+    for fragment in raw_fragments:
+        fragment_tokens = len(tokenizer.encode(fragment, add_special_tokens=False))
+        if current_length + fragment_tokens > max_tokens and current_chunk:
+            chunks_text.append(current_chunk.strip())
+            current_chunk = fragment + " "
+            current_length = fragment_tokens
+        else:
+            current_chunk += fragment + " "
+            current_length += fragment_tokens
+
+    if current_chunk.strip():
+        chunks_text.append(current_chunk.strip())
+
+    # Fusión de fragmentos cortos al final
+    if len(chunks_text) > 1:
+        last_tokens = len(tokenizer.encode(chunks_text[-1], add_special_tokens=False))
+        if last_tokens < 50:
+            chunks_text[-2] += " " + chunks_text.pop()
+
+    results = {"overall_summary": {}, "segments": []}
+    total_human_weighted = 0.0
+    total_ai_weighted = 0.0
+    total_tokens_processed = 0
+    
+    print(f"\nIniciando análisis forense de {len(chunks_text)} segmentos...")
+    
+    # 2. Procesamiento de Segmentos
+    for idx, chunk_text in enumerate(tqdm(chunks_text, desc="Analizando")):
+        # Predicción base del ensamble
+        human_pct, ai_pct = classify_segment(chunk_text)
+        dominant_label = "AI" if ai_pct > human_pct else "Human"
+        
+        forensic_data = None
+        
+        # 3. Ejecución de Plugins vía Orquestador (Solo si el modelo sospecha IA)
+        if orchestrator and dominant_label == "AI":
+            try:
+                # Se usa .run() como define tu plugin_orchestrator.py
+                analisis_full = orchestrator.run(chunk_text)
+                forensic_data = analisis_full.get("additional_analyses", {})
+            except Exception as e:
+                forensic_data = {"error_forense": str(e)}
+
+        # Crear estructura base del segmento
+        segmento_obj = {
+            "segment_id": idx + 1,
+            "text": chunk_text,
+            "dominant_label": dominant_label,
+            "score": round(max(ai_pct, human_pct)),
+            "forensic_analysis": forensic_data,
+            "status_note": None
+        }
+
+        # 4. Validación Cruzada: El orquestador valida o descarta el resultado
+        segmento_obj = validar_veredicto_segmento(segmento_obj)
+        
+        results["segments"].append(segmento_obj)
+        
+        # Actualización de pesos para el resumen global
+        # Si el validador cambió el sello a Humano, invertimos el peso para el resumen
+        final_ai_score = ai_pct if "AI" in segmento_obj["dominant_label"] else (100 - human_pct)
+        final_human_score = 100 - final_ai_score
+
+        chunk_len = len(tokenizer.encode(chunk_text, add_special_tokens=False))
+        total_human_weighted += (final_human_score * chunk_len)
+        total_ai_weighted += (final_ai_score * chunk_len)
+        total_tokens_processed += chunk_len
+
+    # 5. Resumen Final
+    overall_human = round(total_human_weighted / total_tokens_processed)
+    overall_ai = round(total_ai_weighted / total_tokens_processed)
+    
+    results["overall_summary"] = {
+        "total_human_percentage": overall_human,
+        "total_ai_percentage": overall_ai,
+        "overall_prediction": "AI" if overall_ai > overall_human else "Human"
+    }
+    
+    return results
+
+    
+def analyze_long_documentsd_(long_text: str, max_tokens: int = 512) -> dict:
+    """
+    Analiza un documento dividiéndolo de forma inteligente por párrafos u oraciones,
+    evitando cortar palabras por la mitad y agrupando fragmentos cortos.
+    """
+    if not long_text.strip():
+        return {"error": "El documento está vacío."}
+
+    # 1. Dividir el texto en párrafos usando saltos de línea
+    # Si no hay saltos de línea, dividimos por puntos (oraciones)
+    if "\n" in long_text:
+        raw_fragments = [p.strip() for p in re.split(r'\n+', long_text) if p.strip()]
+    else:
+        raw_fragments = [p.strip() + "." for p in re.split(r'(?<=\.)\s+', long_text) if p.strip()]
+
+    chunks_text = []
+    current_chunk = ""
+    current_length = 0
+
+    # 2. Agrupar fragmentos inteligentemente respetando el max_tokens
+    for fragment in raw_fragments:
+        # Medir cuántos tokens tiene este fragmento
+        fragment_tokens = len(tokenizer.encode(fragment, add_special_tokens=False))
+        
+        # Si el fragmento en sí mismo es más grande que el límite (caso raro),
+        # lo forzamos a entrar, pero al menos no cortamos los demás.
+        if current_length + fragment_tokens > max_tokens and current_chunk:
+            chunks_text.append(current_chunk.strip())
+            current_chunk = fragment + " "
+            current_length = fragment_tokens
+        else:
+            current_chunk += fragment + " "
+            current_length += fragment_tokens
+
+    # Agregar el último chunk que quedó en el buffer
+    if current_chunk.strip():
+        chunks_text.append(current_chunk.strip())
+
+    # 3. Fusión del fragmento huérfano (para evitar caídas de precisión)
+    # Si el último chunk tiene muy pocos tokens (ej. menos de 50) y hay más de un chunk,
+    # lo fusionamos con el chunk anterior para darle contexto.
+    if len(chunks_text) > 1:
+        last_chunk_tokens = len(tokenizer.encode(chunks_text[-1], add_special_tokens=False))
+        if last_chunk_tokens < 50:
+            fragment_to_merge = chunks_text.pop()
+            chunks_text[-1] += " " + fragment_to_merge
+
+    results = {"overall_summary": {}, "segments": []}
+    
+    total_human_weighted = 0.0
+    total_ai_weighted = 0.0
+    total_tokens_processed = 0
+    
+    print(f"\nIniciando análisis semántico de {len(chunks_text)} segmentos...")
+    
+    # 4. Procesar iterando con la barra de progreso
+    for idx, chunk_text in enumerate(tqdm(chunks_text, desc="Procesando documento", unit=" chunk")):
+        human_pct, ai_pct = classify_segment(chunk_text)
+        
+        dominant_label = "AI" if ai_pct > human_pct else "Human"
+        dominant_score = max(ai_pct, human_pct)
+            
+        results["segments"].append({
+            "segment_id": idx + 1,
+            "text": chunk_text,
+            "dominant_label": dominant_label,
+            "score": dominant_score
+        })
+        
+        # Ponderación basada en la longitud real en tokens de este bloque
+        chunk_length = len(tokenizer.encode(chunk_text, add_special_tokens=False))
+        total_human_weighted += (human_pct * chunk_length)
+        total_ai_weighted += (ai_pct * chunk_length)
+        total_tokens_processed += chunk_length
+
+    # 5. Cálculo final
+    overall_human = round(total_human_weighted / total_tokens_processed)
+    overall_ai = round(total_ai_weighted / total_tokens_processed)
+    
+    results["overall_summary"] = {
+        "total_human_percentage": overall_human,
+        "total_ai_percentage": overall_ai,
+        "overall_prediction": "AI" if overall_ai > overall_human else "Human"
+    }
+    
+    return results
 
 """
 with iface:

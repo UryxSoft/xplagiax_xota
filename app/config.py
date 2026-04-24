@@ -10,27 +10,30 @@ import os
 
 class Config:
     # ── Flask ──────────────────────────────────────────────────────
-    SECRET_KEY = os.getenv("SECRET_KEY", "dev-only-change-me")
-    DEBUG = os.getenv("FLASK_DEBUG", "0") == "1"
+    SECRET_KEY =  "dev-only-change-me"
+    DEBUG =  "1"
 
     # ── Limits ─────────────────────────────────────────────────────
-    MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_MB", "16")) * 1024 * 1024
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024
 
     # ── Caching (Flask-Caching) ────────────────────────────────────
-    CACHE_TYPE = os.getenv("CACHE_TYPE", "SimpleCache")
-    CACHE_DEFAULT_TIMEOUT = int(os.getenv("CACHE_TIMEOUT", "300"))
+    CACHE_TYPE =  "SimpleCache"
+    CACHE_DEFAULT_TIMEOUT = 300
 
     # ── Compression (Flask-Compress) ───────────────────────────────
     COMPRESS_ALGORITHM = "gzip"
     COMPRESS_MIN_SIZE = 256
 
     # ── Celery (optional, for heavy async plugins) ─────────────────
-    CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
-    CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+    CELERY_BROKER_URL =  "redis://localhost:6379/0"
+    CELERY_RESULT_BACKEND = "redis://localhost:6379/1"
 
     # ── Plugin settings ────────────────────────────────────────────
-    PLUGIN_DIR = os.getenv("PLUGIN_DIR", "app/plugins")
-    PLUGIN_TIMEOUT = int(os.getenv("PLUGIN_TIMEOUT", "30"))  # seconds per plugin
+    PLUGIN_DIR = "app/plugins"
+    PLUGIN_TIMEOUT = 30  # seconds per plugin
+
+    # ── API Security ───────────────────────────────────────────────
+    API_KEY = os.environ.get("API_KEY", "")  # empty = auth disabled
 
     # ── Logging ────────────────────────────────────────────────────
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    LOG_LEVEL = "INFO"
