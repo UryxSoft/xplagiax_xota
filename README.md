@@ -542,6 +542,14 @@ When a plugin runs but fails internally, the response is still `200` and the ind
         }
     }
 }
+
+
+curl -X POST http://localhost:5006/analyze_document  -H "Content-Type: application/json"  -d '{"text": "The Industrial Revolution was one of the most transformative periods in human history, marking the shift from agrarian societies to industrialized economies. Beginning in the late 18th century in Great Britain, it spread to other parts of Europe and eventually to the United States, fundamentally changing how people lived and worked. Before the Industrial Revolution, most production was done by hand in small workshops or at home. This system, often called the “cottage industry,” relied heavily on manual labor and simple tools. However, a series of technological innovations began to revolutionize production. One of the most important inventions was the steam engine, improved by James Watt. This machine allowed factories to operate more efficiently and independently of natural power sources like water. Another key development was the mechanization of the textile industry. Machines such as the spinning jenny and the power loom greatly increased the speed and volume of fabric production. As a result, factories began to replace traditional workshops, leading to the growth of urban centers. Cities expanded rapidly as people moved from rural areas in search of employment opportunities. The Industrial Revolution also had profound social and economic impacts. On one hand, it led to increased production, lower costs of goods, and improved standards of living for many people. On the other hand, it created harsh working conditions, especially in the early years. Workers, including women and children, often faced long hours, low wages, and unsafe environments in factories. In addition, the rise of industrial capitalism changed the structure of society. A new middle class of factory owners and entrepreneurs emerged, while the working class grew significantly. These changes eventually led to social reforms and the development of labor unions, as workers sought better conditions and rights. Despite its challenges, the Industrial Revolution laid the foundation for modern society. It introduced new technologies, transformed economies, and reshaped social structures in ways that continue to influence the world today.", "plugins": ["ai_detection","stylometric_analysis","citation_check"]}'
+
+
+
+
+
 ```
 
 ---
@@ -580,18 +588,19 @@ gunicorn --preload -c gunicorn.conf.py "app:create_app()"
 
 ```bash
 # Build
-DOCKER_BUILDKIT=1 docker build -t xplagiax:latest .
+DOCKER_BUILDKIT=1 docker build -t xplagiax_xota:latest .
 
 # Run
 docker run -d \
-  --name xplagiax \
+  --name xplagiax_xota \
+  --network xplagiax-net 
   --memory=4g \
   --cpus=4 \
   -p 5006:5006 \
   -v /path/to/models:/app/app/engine \
   -e WEB_CONCURRENCY=2 \
   -e LOG_LEVEL=info \
-  xplagiax:latest
+  xplagiax_xota:latest
 ```
 
 > The three model weight files (~600 MB each, ~1.8 GB total) are mounted via volume. They are not baked into the image.

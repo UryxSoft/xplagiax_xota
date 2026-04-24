@@ -26,6 +26,15 @@ import sys
 _ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
+    # Ensure it's also available via the package path
+    if hasattr(sys.modules[__name__], '__path__'):
+        pkg_path = sys.modules[__name__].__path__[0]
+        if pkg_path not in sys.path:
+            sys.path.insert(0, pkg_path)
+
+import logging
+_logger = logging.getLogger(__name__)
+_logger.info("Engine directory added to sys.path: %s", _ENGINE_DIR)
  
 # ── 2. Ensure transformers sees torch as available ────────────
 # transformers >=4.48 has a lazy-loader that checks is_torch_available()
