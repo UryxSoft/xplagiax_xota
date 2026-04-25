@@ -190,42 +190,49 @@ def _gradio_classify(text: str):
 # Reuses the 4 already-loaded models — NO extra memory.
 # Returns (human_percentage, ai_percentage) as a simple tuple.
 
+@torch.inference_mode()
+def classify_batch(texts: List[str]) -> List[Tuple[float, float]]:
+    """
+    Clasifica una lista de segmentos en un solo lote (batch).
+    Es mucho más rápido que procesar uno por uno.
+    """
+    if not texts:
+        return []
+        
+    cleaned_texts = [clean_text(t) for t in texts]
+    
+    # Tokenizar todo el lote a la vez
+    inputs = tokenizer(cleaned_texts, return_tensors="pt", truncation=True, padding=True).to(device)
+
+    # Inferencia del ensamble en paralelo
+    logits_1 = model_1(**inputs).logits
+    logits_2 = model_2(**inputs).logits
+    logits_3 = model_3(**inputs).logits
+    
+    # Promediar probabilidades del lote
+    avg_probs = (
+        torch.softmax(logits_1, dim=1)
+        + torch.softmax(logits_2, dim=1)
+        + torch.softmax(logits_3, dim=1)
+    ) / 3
+    
+    results = []
+    for i in range(len(texts)):
+        probs = avg_probs[i]
+        human_prob = probs[24].item()
+        ai_prob = 1.0 - human_prob
+        results.append((round(human_prob * 100), round(ai_prob * 100)))
+        
+    return results
+
+
+@torch.inference_mode()
 def classify_segment(text: str) -> Tuple[float, float]:
     """
-    Classify a text segment and return (human%, ai%).
-
-    Used as the `classify_fn` injectable for HybridSegmentAnalyzer.
-    Runs the same 4-model ensemble as classify_text() but skips
-    matplotlib chart generation and DetectionResult construction.
+    Clasifica un único segmento. Ahora usa classify_batch internamente.
     """
-    cleaned = clean_text(text)
-    if not cleaned.strip():
-        return 50.0, 50.0
-
-    inputs = tokenizer(cleaned, return_tensors="pt", truncation=True, padding=True).to(device)
-
-    with torch.no_grad():
-        logits_1 = model_1(**inputs).logits
-        logits_2 = model_2(**inputs).logits
-        logits_3 = model_3(**inputs).logits
-        #logits_4 = model_4(**inputs).logits
-        avg_probs = (
-            torch.softmax(logits_1, dim=1)
-            + torch.softmax(logits_2, dim=1)
-            + torch.softmax(logits_3, dim=1)
-            #+ torch.softmax(logits_4, dim=1)
-        ) / 3
-        probs = avg_probs[0]
-
-    human_prob = probs[24].item()
-    ai_clone = probs.clone()
-    ai_clone[24] = 0
-    ai_total = ai_clone.sum().item()
-
-    total = human_prob + ai_total
-    human_pct = (human_prob / total) * 100
-    ai_pct = (ai_total / total) * 100
-    return round(human_pct), round(ai_pct)
+    results = classify_batch([text])
+    return results[0] if results else (50.0, 50.0)
 
 
 def validar_veredicto_segmento(segmento_dict: dict) -> dict:
@@ -343,47 +350,47 @@ def analyze_long_document(long_text: str, orchestrator=None, max_tokens: int = 5
     
     print(f"\nIniciando análisis forense de {len(chunks_text)} segmentos...")
     
-    # 2. Procesamiento de Segmentos
-    for idx, chunk_text in enumerate(tqdm(chunks_text, desc="Analizando")):
-        # Predicción base del ensamble
-        human_pct, ai_pct = classify_segment(chunk_text)
-        dominant_label = "AI" if ai_pct > human_pct else "Human"
+    # 2. Procesamiento de Segmentos por Lotes (Batch size = 4)
+    BATCH_SIZE = 4
+    for i in range(0, len(chunks_text), BATCH_SIZE):
+        batch_slice = chunks_text[i:i + BATCH_SIZE]
+        batch_results = classify_batch(batch_slice)
         
-        forensic_data = None
-        
-        # 3. Ejecución de Plugins vía Orquestador (Solo si el modelo sospecha IA)
-        if orchestrator and dominant_label == "AI":
-            try:
-                # Se usa .run() como define tu plugin_orchestrator.py
-                analisis_full = orchestrator.run(chunk_text)
-                forensic_data = analisis_full.get("additional_analyses", {})
-            except Exception as e:
-                forensic_data = {"error_forense": str(e)}
+        for sub_idx, (human_pct, ai_pct) in enumerate(batch_results):
+            idx = i + sub_idx
+            chunk_text = batch_slice[sub_idx]
+            
+            dominant_label = "AI" if ai_pct > human_pct else "Human"
+            forensic_data = None
+            
+            # Ejecución de Plugins (Individual por segmento)
+            if orchestrator and dominant_label == "AI":
+                try:
+                    analisis_full = orchestrator.run(chunk_text)
+                    forensic_data = analisis_full.get("additional_analyses", {})
+                except Exception as e:
+                    forensic_data = {"error_forense": str(e)}
 
-        # Crear estructura base del segmento
-        segmento_obj = {
-            "segment_id": idx + 1,
-            "text": chunk_text,
-            "dominant_label": dominant_label,
-            "score": round(max(ai_pct, human_pct)),
-            "forensic_analysis": forensic_data,
-            "status_note": None
-        }
+            segmento_obj = {
+                "segment_id": idx + 1,
+                "text": chunk_text,
+                "dominant_label": dominant_label,
+                "score": round(max(ai_pct, human_pct)),
+                "forensic_analysis": forensic_data,
+                "status_note": None
+            }
 
-        # 4. Validación Cruzada: El orquestador valida o descarta el resultado
-        segmento_obj = validar_veredicto_segmento(segmento_obj)
-        
-        results["segments"].append(segmento_obj)
-        
-        # Actualización de pesos para el resumen global
-        # Si el validador cambió el sello a Humano, invertimos el peso para el resumen
-        final_ai_score = ai_pct if "AI" in segmento_obj["dominant_label"] else (100 - human_pct)
-        final_human_score = 100 - final_ai_score
+            segmento_obj = validar_veredicto_segmento(segmento_obj)
+            results["segments"].append(segmento_obj)
+            
+            # Actualización de pesos
+            final_ai_score = ai_pct if "AI" in segmento_obj["dominant_label"] else (100 - human_pct)
+            final_human_score = 100 - final_ai_score
 
-        chunk_len = len(tokenizer.encode(chunk_text, add_special_tokens=False))
-        total_human_weighted += (final_human_score * chunk_len)
-        total_ai_weighted += (final_ai_score * chunk_len)
-        total_tokens_processed += chunk_len
+            chunk_len = len(tokenizer.encode(chunk_text, add_special_tokens=False))
+            total_human_weighted += (final_human_score * chunk_len)
+            total_ai_weighted += (final_ai_score * chunk_len)
+            total_tokens_processed += chunk_len
 
     # 5. Resumen Final
     overall_human = round(total_human_weighted / total_tokens_processed)
@@ -453,25 +460,30 @@ def analyze_long_documentsd_(long_text: str, max_tokens: int = 512) -> dict:
     
     print(f"\nIniciando análisis semántico de {len(chunks_text)} segmentos...")
     
-    # 4. Procesar iterando con la barra de progreso
-    for idx, chunk_text in enumerate(tqdm(chunks_text, desc="Procesando documento", unit=" chunk")):
-        human_pct, ai_pct = classify_segment(chunk_text)
+    # 4. Procesar por lotes (Batch size = 4)
+    BATCH_SIZE = 4
+    for i in range(0, len(chunks_text), BATCH_SIZE):
+        batch_slice = chunks_text[i:i + BATCH_SIZE]
+        batch_results = classify_batch(batch_slice)
         
-        dominant_label = "AI" if ai_pct > human_pct else "Human"
-        dominant_score = max(ai_pct, human_pct)
+        for sub_idx, (human_pct, ai_pct) in enumerate(batch_results):
+            idx = i + sub_idx
+            chunk_text = batch_slice[sub_idx]
             
-        results["segments"].append({
-            "segment_id": idx + 1,
-            "text": chunk_text,
-            "dominant_label": dominant_label,
-            "score": dominant_score
-        })
-        
-        # Ponderación basada en la longitud real en tokens de este bloque
-        chunk_length = len(tokenizer.encode(chunk_text, add_special_tokens=False))
-        total_human_weighted += (human_pct * chunk_length)
-        total_ai_weighted += (ai_pct * chunk_length)
-        total_tokens_processed += chunk_length
+            dominant_label = "AI" if ai_pct > human_pct else "Human"
+            dominant_score = max(ai_pct, human_pct)
+                
+            results["segments"].append({
+                "segment_id": idx + 1,
+                "text": chunk_text,
+                "dominant_label": dominant_label,
+                "score": dominant_score
+            })
+            
+            chunk_length = len(tokenizer.encode(chunk_text, add_special_tokens=False))
+            total_human_weighted += (human_pct * chunk_length)
+            total_ai_weighted += (ai_pct * chunk_length)
+            total_tokens_processed += chunk_length
 
     # 5. Cálculo final
     overall_human = round(total_human_weighted / total_tokens_processed)
