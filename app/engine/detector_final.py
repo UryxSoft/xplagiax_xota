@@ -2,6 +2,8 @@
 # reference the global `device`, even if a later import fails. ──────
 import torch
 import os
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 import sys
 import re
 import time
