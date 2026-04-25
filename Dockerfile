@@ -48,7 +48,8 @@ nltk.download('punkt_tab', download_dir='/root/nltk_data'); \
 nltk.download('averaged_perceptron_tagger_eng', download_dir='/root/nltk_data')"
 
 # ── Pre-download spaCy model (en_core_web_sm for HallucinationProfiler) ─────
-RUN python -m spacy download en_core_web_sm
+# We download it to /root/.local so it gets copied to the runtime stage
+RUN python -m spacy download en_core_web_sm --prefix=/root/.local
 
 # ── Pre-cache HuggingFace tokenizer + config for ModernBERT-base ─────────────
 # detector_final.py uses local_files_only=True so the HF cache MUST exist
