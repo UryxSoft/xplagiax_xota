@@ -1,0 +1,41 @@
+# ── Virtual environment (reinstalled inside container from requirements.txt) ──
+.venv/
+venv/
+env/
+
+# ── Git history ───────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Python cache ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# ── Secrets (never bake into image) ──────────────────────────────────────────
+.env
+*.env
+.env.*
+!.env.example
+
+# ── Logs + temp files ────────────────────────────────────────────────────────
+*.log
+nohup.out
+*.out
+
+# ── Dev / editor files ────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# ── Docs (not needed at runtime) ─────────────────────────────────────────────
+README.md
+README*.md
+*.md
+
+# ── Test data ────────────────────────────────────────────────────────────────
+te.text

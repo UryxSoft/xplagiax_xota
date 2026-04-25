@@ -35,25 +35,15 @@ if _ENGINE_DIR not in sys.path:
 import logging
 _logger = logging.getLogger(__name__)
 _logger.info("Engine directory added to sys.path: %s", _ENGINE_DIR)
- 
-# ── 2. Ensure transformers sees torch as available ────────────
-# transformers >=4.48 has a lazy-loader that checks is_torch_available()
-# via BACKENDS_MAPPING at attribute-access time.  With torch 2.2.2 the
-# stdlib version check is fine (_torch_available is True), but we
-# reinforce the guard so reloads under Werkzeug can't hit a stale state.
-# NOTE: do NOT fake get_torch_version() — code in utils/generic.py uses
-# that function to gate torch 2.2+ features; lying about the version
-# would cause AttributeErrors when it tries to use 2.4+ APIs on 2.2.2.
+
+# ── 2. Verify torch is importable ─────────────────────────────
+# With torch>=2.4 and transformers>=4.48 we no longer need to monkey-patch
+# is_torch_available(). Log a warning if torch fails to import so the
+# engine degrades gracefully rather than crashing the whole app.
 try:
-    import torch  # noqa
-    import transformers.utils.import_utils as _tiu
-    # Force is_torch_available to always return True
-    _tiu.is_torch_available = lambda: True
-    if hasattr(_tiu, "_torch_available"):
-        _tiu._torch_available = True
-    # Patch BACKENDS_MAPPING so lazy attribute access never blocks on torch
-    if hasattr(_tiu, "BACKENDS_MAPPING") and "torch" in _tiu.BACKENDS_MAPPING:
-        original = _tiu.BACKENDS_MAPPING["torch"]
-        _tiu.BACKENDS_MAPPING["torch"] = (lambda: True, original[1])
-except Exception:
-    pass
+    import torch  # noqa: F401
+    _logger.info("PyTorch %s loaded on engine init.", torch.__version__)
+except ImportError:
+    _logger.warning(
+        "torch not installed — engine will run in CPU-only / limited mode."
+    )

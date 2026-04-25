@@ -586,24 +586,22 @@ gunicorn --preload -c gunicorn.conf.py "app:create_app()"
 
 ### Docker
 
-```bash
-# Build
-DOCKER_BUILDKIT=1 docker build -t xplagiax_xota:latest .
+To build and run the microservice using Docker:
 
-# Run
+```bash
+# 1. Build the image
+docker build -t xplagiax:latest .
+
+# 2. Run the container with 2 workers
+# Ensure model files are in app/engine/ before building, or mount them.
 docker run -d \
-  --name xplagiax_xota \
-  --network xplagiax-net 
-  --memory=4g \
-  --cpus=4 \
+  --name xplagiax-service \
   -p 5006:5006 \
-  -v /path/to/models:/app/app/engine \
   -e WEB_CONCURRENCY=2 \
-  -e LOG_LEVEL=info \
-  xplagiax_xota:latest
+  xplagiax:latest
 ```
 
-> The three model weight files (~600 MB each, ~1.8 GB total) are mounted via volume. They are not baked into the image.
+> **Note**: The Dockerfile is configured to use Gunicorn with `preload_app=True`, ensuring that the heavy ModernBERT models are shared across the 2 workers using Linux Copy-on-Write (CoW).
 
 ---
 

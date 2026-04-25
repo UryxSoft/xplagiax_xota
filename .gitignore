@@ -1,0 +1,55 @@
+# ── Python Virtual Environment ──────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Large Model Weights (DO NOT UPLOAD TO GIT) ──────────────────────────────
+# These should be downloaded directly on the server
+app/engine/*.bin
+app/engine/Model_groups_*
+models/
+
+# ── Python Cache & Temp Files ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ── Environment Variables (Secrets) ─────────────────────────────────────────
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+*.log
+flask.log
+nohup.out
+
+# ── OS Files ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Editor Files ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
