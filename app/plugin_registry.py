@@ -19,6 +19,7 @@ import logging
 import os
 import pkgutil
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -63,32 +64,42 @@ class PluginRegistry:
         """
         results: Dict[str, Any] = {}
 
-        for pname in plugin_names:
-            plugin = self.get(pname)
-            if plugin is None:
-                results[pname] = {
-                    "error": f"Plugin '{pname}' not found",
-                    "available": self.list_plugins(),
-                }
-                continue
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            for pname in plugin_names:
+                plugin = self.get(pname)
+                if plugin is None:
+                    results[pname] = {
+                        "error": f"Plugin '{pname}' not found",
+                        "available": self.list_plugins(),
+                    }
+                    continue
 
-            t0 = time.perf_counter()
-            try:
-                result = plugin.analyze(text)
-                elapsed = time.perf_counter() - t0
-                results[pname] = {
-                    "status": "ok",
-                    "data": result,
-                    "elapsed_ms": round(elapsed * 1000, 1),
-                }
-            except Exception as exc:
-                elapsed = time.perf_counter() - t0
-                logger.error("Plugin '%s' failed: %s", pname, exc, exc_info=True)
-                results[pname] = {
-                    "status": "error",
-                    "error": str(exc),
-                    "elapsed_ms": round(elapsed * 1000, 1),
-                }
+                t0 = time.perf_counter()
+                future = executor.submit(plugin.analyze, text)
+                try:
+                    result = future.result(timeout=timeout)
+                    elapsed = time.perf_counter() - t0
+                    results[pname] = {
+                        "status": "ok",
+                        "data": result,
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                    }
+                except FuturesTimeoutError:
+                    elapsed = time.perf_counter() - t0
+                    logger.error("Plugin '%s' timed out after %ds", pname, timeout)
+                    results[pname] = {
+                        "status": "error",
+                        "error": f"Plugin timed out after {timeout}s",
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                    }
+                except Exception as exc:
+                    elapsed = time.perf_counter() - t0
+                    logger.error("Plugin '%s' failed: %s", pname, exc, exc_info=True)
+                    results[pname] = {
+                        "status": "error",
+                        "error": str(exc),
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                    }
 
         return results
 

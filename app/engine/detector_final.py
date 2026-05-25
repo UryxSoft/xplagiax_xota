@@ -109,7 +109,16 @@ def classify_text(text):
     """
     cleaned_text = clean_text(text)
     if not cleaned_text.strip():
-        return "", None
+        empty_result = DetectionResult(
+            prediction="Unknown",
+            confidence=0,
+            human_percentage=50,
+            ai_percentage=50,
+            detected_model=None,
+            raw_scores={"human": 0, "ai_total": 0},
+            uncertainty_zone=True,
+        )
+        return "", None, empty_result
 
     inputs = tokenizer(cleaned_text, return_tensors="pt", truncation=True, padding=True).to(device)
 
@@ -162,10 +171,9 @@ def classify_text(text):
         ax.text(bar.get_x() + bar.get_width() / 2, height + 1, f'{height:.2f}%', ha='center')
 
 
-    ax.set_ylim(0, 100) 
+    ax.set_ylim(0, 100)
     plt.tight_layout()
 
-    # --- LO QUE FALTABA: Construir el objeto DetectionResult ---
     human_percentage = round(human_percentage)
     ai_percentage    = round(ai_percentage)
 
@@ -178,7 +186,7 @@ def classify_text(text):
         raw_scores={"human": round(human_prob), "ai_total": round(ai_total_prob)}
     )
 
-    # Devolver los 3 elementos exactamente como espera el orquestador
+    plt.close(fig)
     return result_message, fig, det_result
 
 # [ADDED v1.1] Gradio wrapper — unpacks only (msg, fig) for Gradio outputs.

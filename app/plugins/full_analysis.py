@@ -9,10 +9,23 @@ Wraps PluginOrchestrator.run() to execute all enabled analyses:
 Returns the full forensic report as JSON + optionally HTML.
 """
 
+import glob
 import logging
 import os
 import tempfile
+import time
 from typing import Any, Dict
+
+
+def _cleanup_old_reports(directory: str, prefix: str, max_age_seconds: int) -> None:
+    """Delete report files older than max_age_seconds to prevent disk exhaustion."""
+    cutoff = time.time() - max_age_seconds
+    for path in glob.glob(os.path.join(directory, f"{prefix}*.html")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
 
 from app.plugins.base import BasePlugin
 
@@ -117,6 +130,7 @@ class FullAnalysisPlugin(BasePlugin):
 
             # Generate HTML report to temp file and include path
             try:
+                _cleanup_old_reports("/tmp", prefix="forensic_", max_age_seconds=3600)
                 tmp = tempfile.NamedTemporaryFile(
                     suffix=".html", prefix="forensic_",
                     dir="/tmp", delete=False,

@@ -6,9 +6,9 @@ Key design decisions:
       then forks workers. Heavy models (torch, spacy, etc.) loaded at
       module level are shared across workers via Linux Copy-on-Write,
       cutting per-worker memory from ~500MB to ~50MB overhead.
-    - worker_class = "gevent" → cooperative concurrency for I/O-bound
-      workloads (HTTP, DB, Redis).  Each worker handles hundreds of
-      concurrent connections with minimal thread overhead.
+    - worker_class = "sync" → PyTorch/transformers use C-level threads
+      internally; gevent monkey-patching causes deadlocks with ML workloads.
+      sync workers are correct for CPU-bound inference.
     - workers = 4 → 2×CPU for CPU-bound NLP tasks.  Override via
       WEB_CONCURRENCY env var for auto-scaling.
 """
@@ -22,7 +22,7 @@ bind = os.getenv("GUNICORN_BIND", "0.0.0.0:5006")
 # ── Workers ───────────────────────────────────────────────────────
 workers = int(os.getenv("WEB_CONCURRENCY",
                         min(multiprocessing.cpu_count() * 2, 8)))
-worker_class = "gevent"
+worker_class = "sync"
 threads = 2
 
 # ── CRITICAL: Enable preload for CoW memory sharing ──────────────
