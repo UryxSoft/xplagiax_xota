@@ -5,3 +5,28 @@ curl -X POST http://localhost:5006/analyze \ -H "Content-Type: application/json"
 wget "https://huggingface.co/spaces/SzegedAI/AI_Detector/resolve/main/modernbert.bin?download=true" -O modernbert.bin
 wget "https://huggingface.co/mihalykiss/modernbert_2/resolve/main/Model_groups_3class_seed12" -O Model_groups_3class_seed12
 wget "https://huggingface.co/mihalykiss/modernbert_2/resolve/main/Model_groups_3class_seed22" -O Model_groups_3class_seed22
+
+
+####
+docker stop xplagiax_celery_worker 2>/dev/null || true
+docker rm   xplagiax_celery_worker 2>/dev/null || true
+
+# Rebuild con el nuevo gunicorn.conf.py
+docker build -t xplagiax_xota:latest .
+
+# Parar el actual
+docker stop xplagiax-xota
+docker rm   xplagiax-xota
+
+# Lanzar — el gunicorn.conf.py forkea Celery internamente via when_ready
+docker run -d \
+  --name xplagiax-xota \
+  --network xplagiax-net \
+  -p 5006:5006 \
+  -e REDIS_URL="redis://redis:6379" \
+  -e WEB_CONCURRENCY="2" \
+  -e SECRET_KEY="$(openssl rand -hex 32)" \
+  --memory=5g \
+  --memory-swap=5g \
+  xplagiax_xota:latest
+#####
