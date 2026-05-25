@@ -673,6 +673,36 @@ xplagiax_xota/
 
 ---
 
+```bash
+
+# Eliminar el worker separado si lo tienes corriendo
+docker stop xplagiax_celery_worker 2>/dev/null || true
+docker rm xplagiax_celery_worker 2>/dev/null || true
+
+# Rebuild con el nuevo gunicorn.conf.py
+docker build -t xplagiax_xota:latest .
+
+# Relanzar el contenedor único — ahora incluye el worker de Celery internamente
+docker stop xplagiax-xota
+docker run -d \
+  --name xplagiax-xota \
+  --network xplagiax-net \
+  -p 5006:5006 \
+  -e WEB_CONCURRENCY=2 \
+  -e REDIS_URL="redis://redis:6379" \
+  xplagiax_xota:latest
+
+# Ver los 3 procesos (master + 2 workers + celery) en el mismo contenedor
+docker exec xplagiax-xota ps aux | grep -E "gunicorn|celery"
+
+# Confirmar que el celery worker está conectado a Redis
+docker logs xplagiax-xota 2>&1 | grep -E "celery|Celery|CoW"
+
+# Monitorear RAM — debe quedarse estable sin duplicar
+docker stats xplagiax-xota --no-stream
+
+```
+
 ## Kubernetes Deployment
 
 ```yaml
