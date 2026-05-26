@@ -24,7 +24,7 @@ docker run -d \
   --network xplagiax-net \
   -p 5006:5006 \
   -e REDIS_URL="redis://redis:6379" \
-  -e WEB_CONCURRENCY="2" \
+  -e WEB_CONCURRENCY="1" \
   -e SECRET_KEY="$(openssl rand -hex 32)" \
   --memory=5g \
   --memory-swap=5g \
