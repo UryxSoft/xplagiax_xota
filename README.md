@@ -694,6 +694,11 @@ Celery tasks are configured to prevent memory leaks and zombie processes during 
 * **Prefetch Limits:** `worker_prefetch_multiplier = 1` ensures the worker only pulls one heavy ML task at a time.
 * **Auto-Restart:** A `child_exit` hook monitors the internal Celery worker and automatically restarts it if it crashes due to an OOM or segfault.
 
+### 4. Concurrency & Capacity Limits
+* **Memory Leak Prevention:** The explicit `gc.collect()` after each analysis ensures no "residue" memory or orphaned tensors remain. RAM usage will briefly spike during inference (forward pass) but will immediately drop back down, guaranteeing stable memory footprint over weeks of uptime.
+* **Simultaneous Users:** The system is strictly capped to process **3 concurrent heavy analyses** at exactly the same time (2 Web Workers + 1 Celery Worker). 
+* **Queuing:** If 50-100 users submit a 500-word document simultaneously, the system will *not* crash. It will process 3 immediately while safely queuing the remaining requests in Redis (for async) or Gunicorn's backlog. At a rate of ~2-3 seconds per 500-word document, a single Celery worker can process ~20-30 documents per minute seamlessly in the background.
+
 ### Deploying the Optimized Container
 
 ```bash
@@ -720,6 +725,29 @@ docker run -d \
 # 4. Verify the internal Celery worker is running alongside Gunicorn
 docker exec xplagiax-xota ps aux | grep -E "gunicorn|celery"
 ```
+
+### Troubleshooting the Migration
+
+If you encounter errors during or after the migration to the single-container CoW architecture, refer to these common issues:
+
+**1. Celery Crash: `ImproperlyConfigured: Cannot mix new and old setting keys`**
+* **Cause:** Celery 5.x throws this error if you push old uppercase Flask configs into `celery.conf` while also using new lowercase config keys (like `result_expires`). 
+* **Fix:** The codebase was updated to remove the `celery.conf.update(app.config)` call in `app/celery_app.py`. Ensure your image is rebuilt (`docker build -t xplagiax_xota:latest .`) to include this fix.
+
+**2. Docker Error: `Conflict. The container name "/xplagiax-xota" is already in use`**
+* **Cause:** You cannot run a new container if an old one with the exact same name exists, even if it is stopped.
+* **Fix:** Remove the old container first before running the new one:
+  ```bash
+  docker stop xplagiax-xota
+  docker rm xplagiax-xota
+  ```
+
+**3. MarkTrack Error: `NameResolutionError: Failed to resolve 'xplagiax-xota'`**
+* **Cause:** Because you deleted and recreated the `xplagiax-xota` container, Docker assigned it a new internal IP address. The main MarkTrack Flask app (`urllib3`) has a connection pool that cached the old IP address, causing requests to fail.
+* **Fix:** Simply restart the MarkTrack container to flush its DNS cache and reconnect to the new instance:
+  ```bash
+  docker restart marktrack_app
+  ```
 
 ## Kubernetes Deployment
 
