@@ -191,7 +191,15 @@ def analyze_document():
         ai_result = results["ai_detection"]
         if ai_result.get("status") == "ok" and isinstance(ai_result.get("data"), dict):
             ai_result["data"]["segments"] = segments
-            ai_result["data"]["overall_summary"] = doc_result.get("overall_summary", {})
+            
+            summary = doc_result.get("overall_summary", {})
+            ai_result["data"]["overall_summary"] = summary
+            
+            if summary:
+                ai_result["data"]["human_percentage"] = summary.get("total_human_percentage", 50)
+                ai_result["data"]["ai_percentage"] = summary.get("total_ai_percentage", 50)
+                ai_result["data"]["confidence"] = max(summary.get("total_human_percentage", 50), summary.get("total_ai_percentage", 50))
+                ai_result["data"]["prediction"] = summary.get("overall_prediction", "Unknown")
 
     elapsed = time.perf_counter() - t0
     logger.info(
