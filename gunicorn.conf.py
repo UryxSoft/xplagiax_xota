@@ -20,8 +20,10 @@ import sys
 bind = os.getenv("GUNICORN_BIND", "0.0.0.0:5006")
 
 # ── Workers ───────────────────────────────────────────────────────
+# ML workloads: each worker costs ~200 MB+ overhead (on top of CoW-shared models).
+# Cap at 2 for memory-constrained VPS. Override via WEB_CONCURRENCY env var.
 workers = int(os.getenv("WEB_CONCURRENCY",
-                        min(multiprocessing.cpu_count() * 2, 8)))
+                        min(multiprocessing.cpu_count(), 2)))
 worker_class = "sync"
 threads = 2
 
@@ -98,10 +100,40 @@ def on_exit(server):
         _celery_process.terminate()
         _celery_process.join(timeout=10)
 
+def child_exit(server, worker):
+    """
+    Called when a child process exits.
+    If the dead child is our Celery worker, restart it automatically
+    so async analysis tasks don't pile up in Redis indefinitely.
+    """
+    global _celery_process
+    if _celery_process and not _celery_process.is_alive():
+        server.log.warning(
+            "Celery worker (PID %s) murió — reiniciando...",
+            _celery_process.pid,
+        )
+        # Re-use the same _run_celery bootstrap from when_ready
+        def _run_celery():
+            from celery.__main__ import main as celery_main
+            import sys
+            sys.argv = [
+                "celery", "-A", "app.celery_app.celery", "worker",
+                "--loglevel=info", "--pool=solo", "--concurrency=1",
+                "--without-heartbeat", "--without-gossip", "--without-mingle",
+            ]
+            celery_main()
+
+        _celery_process = multiprocessing.Process(
+            target=_run_celery, name="celery-worker", daemon=True
+        )
+        _celery_process.start()
+        server.log.info("Celery worker reiniciado — nuevo PID %s", _celery_process.pid)
+
 def post_fork(server, worker):
     """Called just after a worker has been forked."""
     server.log.info("Worker spawned — PID %s", worker.pid)
 
 def worker_exit(server, worker):
     """Called when a worker exits."""
+
     server.log.info("Worker exiting — PID %s", worker.pid)

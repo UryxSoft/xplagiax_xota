@@ -15,7 +15,15 @@ def make_celery():
         backend=app.config['CELERY_RESULT_BACKEND']
     )
     celery.conf.update(app.config)
-    
+
+    # ── Cleanup settings ─────────────────────────────────────────────────────
+    # Auto-delete task results from Redis after 1 hour (prevents Redis bloat)
+    celery.conf.result_expires = 3600
+    # ACK the task only after it completes — re-queues on worker crash
+    celery.conf.task_acks_late = True
+    # Prefetch 1 task at a time (important for memory-heavy ML tasks)
+    celery.conf.worker_prefetch_multiplier = 1
+
     # TaskBase override to ensure Flask context is active during task execution
     class ContextTask(celery.Task):
         def __call__(self, *args, **kwargs):
