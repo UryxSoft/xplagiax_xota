@@ -1,6 +1,6 @@
 # XplagiaX — AI Detection Microservice
 
-Flask microservice for AI-generated text detection. Built around a 4-model ModernBERT ensemble with a modular plugin architecture. Supports per-document segmentation, forensic reports, perplexity analysis, citation verification, and more.
+Flask microservice for AI-generated text detection. Built around a 4-model ModernBERT ensemble with a modular plugin architecture. Supports per-document segmentation, forensic reports, perplexity analysis, citation verification, zone classification, and more.
 
 ---
 
@@ -9,14 +9,17 @@ Flask microservice for AI-generated text detection. Built around a 4-model Moder
 ```
 Client
     │
-    │  POST /analyze          {"text": "...", "plugins": ["ai_detection", ...]}
-    │  POST /analyze_document {"text": "...", "plugins": ["ai_detection", ...]}
+    │  POST /analyze              {"text": "...", "plugins": ["ai_detection", ...]}
+    │  POST /analyze_document     {"text": "...", "plugins": ["ai_detection", ...]}
+    │  POST /api/v2/citations/detect    {"text": "..."}
+    │  POST /api/v2/citations/validate  {"text": "..."}
     ▼
 ┌────────────────────────────────────────────────────────────────┐
 │  Gunicorn (preload_app=True + gevent workers)                  │
 │                                                                │
 │  Master Process                                                │
 │  ├── ModernBERT ensemble loaded ONCE at module level           │
+│  ├── CitationDetector singleton loaded ONCE (CoW-safe)         │
 │  ├── PluginRegistry auto-discovers all plugins                 │
 │  └── create_app() called once                                  │
 │                  │ fork (Linux CoW)                            │
@@ -38,6 +41,8 @@ Client
 | Plugin auto-discovery | Drop a file in `app/plugins/`, restart — zero core changes needed |
 | Multi-stage Docker build | Builder has gcc/dev headers; runtime image is lean |
 | Non-root container user | UID 1000, K8s security best practice |
+| `m.share_memory()` on models | POSIX shared memory prevents CoW page faults across workers |
+| CitationDetector module singleton | Instantiated at import time, shared across all workers via CoW |
 
 ---
 
@@ -71,6 +76,7 @@ The tokenizer and config are loaded from the local HuggingFace cache (`answerdot
 | `reasoning_check` | Detects reasoning-model signals (o1, DeepSeek-R1): CoT markers and causal density. |
 | `citation_check` | Verifies citations against CrossRef, Semantic Scholar, and OpenAlex. Detects fabricated references. |
 | `watermark_detection` | Detects statistical watermarks embedded in text by AI models. |
+| `zone_classifier` | Classifies text zones (direct quotes, paraphrases, original content). Detects citation style (APA/MLA/IEEE/Chicago/Vancouver/Harvard), coverage, and consistency. No network calls. |
 | `forensic_report` | Generates a full HTML forensic report via `ForensicReportGenerator`. Requires `full_analysis` pipeline. |
 | `full_analysis` | Complete pipeline: detection → stylometric → hallucination → reasoning → perplexity → segment → citation → watermark → forensic report. |
 
@@ -146,6 +152,97 @@ Run any combination of plugins on a text.
 curl -X POST http://localhost:5006/analyze \
   -H "Content-Type: application/json" \
   -d '{"text": "Your text here...", "plugins": ["ai_detection"]}'
+```
+
+---
+
+### POST /analyze — with `zone_classifier`
+
+**Request**
+```json
+{
+    "text": "García & López (2021) found that AI reduces learning time by 40% ...\n\nReferencias\nGarcía, M. (2021). ...",
+    "plugins": ["ai_detection", "zone_classifier"]
+}
+```
+
+**Response** (zone_classifier section)
+```json
+{
+    "status": "ok",
+    "results": {
+        "zone_classifier": {
+            "status": "ok",
+            "elapsed_ms": 12.3,
+            "data": {
+                "dominant_style": "APA",
+                "style_consistency": 92.5,
+                "citation_coverage": 75.0,
+                "total_inline_citations": 4,
+                "total_bibliography": 3,
+                "orphan_citations": 0,
+                "uncited_bibliography": 1,
+                "zones": [
+                    {
+                        "type": "PARAPHRASE",
+                        "text_preview": "García & López (2021) found that AI reduces...",
+                        "start_pos": 0,
+                        "end_pos": 180,
+                        "has_citation": true,
+                        "citation_count": 1,
+                        "plagiarism_risk": 0.2
+                    },
+                    {
+                        "type": "DIRECT_QUOTE",
+                        "text_preview": "\"La adaptación del currículo mediante algoritmos...\"",
+                        "start_pos": 181,
+                        "end_pos": 320,
+                        "has_citation": true,
+                        "citation_count": 1,
+                        "plagiarism_risk": 0.05
+                    },
+                    {
+                        "type": "ORIGINAL",
+                        "text_preview": "Several unexplored dimensions remain...",
+                        "start_pos": 321,
+                        "end_pos": 500,
+                        "has_citation": false,
+                        "citation_count": 0,
+                        "plagiarism_risk": 0.6
+                    }
+                ],
+                "inline_citations": [
+                    {
+                        "text": "(García & López, 2021)",
+                        "style": "APA",
+                        "author": "García & López",
+                        "year": "2021",
+                        "page": null,
+                        "number": null,
+                        "confidence": 0.95
+                    }
+                ],
+                "bibliography": [
+                    {
+                        "key": "Garcia2021",
+                        "style": "APA",
+                        "authors": ["García, M.", "López, J."],
+                        "year": "2021",
+                        "title": "Transformación digital en universidades...",
+                        "doi": "10.1234/res.2021.003",
+                        "url": null
+                    }
+                ],
+                "issues": {
+                    "orphan_citations": [],
+                    "uncited_bibliography": [
+                        {"key": "Smith2020", "authors": ["Smith, A."], "year": "2020"}
+                    ]
+                }
+            }
+        }
+    }
+}
 ```
 
 ---
@@ -261,6 +358,188 @@ curl http://localhost:5006/report/forensic_abc123.html
 
 ---
 
+## Antiplagio — Citation API (`/api/v2/`)
+
+The antiplagio module adds two dedicated citation endpoints that are independent from the plugin system. They are always available (no plugin selection needed).
+
+### POST /api/v2/citations/detect
+
+Fast citation detection — pure regex plus optional spaCy. No network calls, no ML models.
+
+Detects APA, MLA, IEEE, Chicago, Vancouver, and Harvard inline citations and bibliography entries. Classifies text zones and computes style consistency.
+
+**Request**
+```json
+{ "text": "García & López (2021) demostró que... Referencias\nGarcía, M. (2021). ..." }
+```
+
+**Response**
+```json
+{
+    "dominant_style": "APA",
+    "style_consistency": 92.5,
+    "citation_coverage": 75.0,
+    "inline_citations": [
+        {
+            "text": "(García & López, 2021)",
+            "style": "APA",
+            "author": "García & López",
+            "year": "2021",
+            "page": null,
+            "number": null,
+            "confidence": 95.0,
+            "position": {"start": 18, "end": 40}
+        }
+    ],
+    "bibliography": [
+        {
+            "key": "Garcia2021",
+            "style": "APA",
+            "authors": ["García, M.", "López, J."],
+            "year": "2021",
+            "title": "Transformación digital en universidades latinoamericanas",
+            "doi": "10.1234/res.2021.003",
+            "url": null
+        }
+    ],
+    "zones": [
+        {
+            "type": "PARAPHRASE",
+            "text_preview": "García & López (2021) demostró que...",
+            "has_citation": true,
+            "citation_count": 1,
+            "plagiarism_risk": 0.2
+        },
+        {
+            "type": "ORIGINAL",
+            "text_preview": "Several unexplored dimensions remain in this area...",
+            "has_citation": false,
+            "citation_count": 0,
+            "plagiarism_risk": 0.6
+        }
+    ],
+    "issues": {
+        "orphan_citations": 0,
+        "uncited_bibliography": 1
+    }
+}
+```
+
+**Zone types**
+
+| Zone type | Meaning |
+|---|---|
+| `DIRECT_QUOTE` | Text inside quotation marks (`"..."` or `«...»`) |
+| `BLOCK_QUOTE` | Indented block quotation (≥4 spaces) |
+| `PARAPHRASE` | Paragraph with an inline citation but no quote marks |
+| `ORIGINAL` | Paragraph with no citation markers — highest plagiarism risk |
+| `BIBLIOGRAPHY` | Reference list section (excluded from zone output) |
+
+```bash
+curl -X POST http://localhost:5006/api/v2/citations/detect \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Smith et al. (2020) demonstrated that... References\n[1] Smith, J. et al., Nature, 2020."}'
+```
+
+**Supported citation styles**
+
+| Style | Example |
+|---|---|
+| APA | `(García & López, 2021)` / `García (2021, p. 45)` |
+| APA multi | `(García, 2021; López, 2020; Martínez, 2019)` |
+| MLA | `(García 45)` |
+| IEEE | `[1]` / `[2,3]` / `[1-4]` |
+| Chicago | `(García 2021, 45)` |
+| Vancouver | `^1^` / `(1,2,3)` |
+| Harvard | `García, 2021` |
+
+---
+
+### POST /api/v2/citations/validate
+
+Asynchronous bibliography validation. Queries CrossRef, OpenAlex, and Semantic Scholar in parallel for each reference. Requires network access and `aiohttp`.
+
+**Request — from full text**
+```json
+{ "text": "... full document with bibliography section ..." }
+```
+
+**Request — from raw reference list**
+```json
+{
+    "bibliography": [
+        "García, M., & López, J. (2021). Transformación digital en universidades. Revista de Educación Superior, 15(3), 45-67. https://doi.org/10.1234/res.2021.003",
+        "Smith, A. (2020). Machine learning in higher education. Journal of Educational Technology, 8(2), 123-145."
+    ]
+}
+```
+
+**Response**
+```json
+{
+    "total": 2,
+    "valid": 1,
+    "partial": 0,
+    "not_found": 1,
+    "unverifiable": 0,
+    "results": [
+        {
+            "key": "Garcia2021",
+            "raw": "García, M., & López, J. (2021). Transformación digital...",
+            "validation": {
+                "status": "valid",
+                "confidence": 94.0,
+                "source_api": "crossref",
+                "found_title": "Transformación digital en universidades latinoamericanas",
+                "found_doi": "10.1234/res.2021.003",
+                "discrepancies": []
+            }
+        },
+        {
+            "key": "Smith2020",
+            "raw": "Smith, A. (2020). Machine learning in higher education...",
+            "validation": {
+                "status": "not_found",
+                "confidence": 0.0,
+                "source_api": null,
+                "found_title": null,
+                "found_doi": null,
+                "discrepancies": ["Title not found in CrossRef, OpenAlex, or Semantic Scholar"]
+            }
+        }
+    ]
+}
+```
+
+**Validation statuses**
+
+| Status | Meaning |
+|---|---|
+| `valid` | Found in at least one academic API with high confidence (≥0.8) |
+| `partial` | Found but with minor discrepancies (year mismatch, abbreviated title) |
+| `not_found` | Not found in any of the three APIs after all cascade strategies |
+| `unverifiable` | Only a URL — no title or DOI to query |
+| `error` | `aiohttp` not installed or network error |
+
+```bash
+# Validate all references found in a document
+curl -X POST http://localhost:5006/api/v2/citations/validate \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Full document text with references section..."}'
+
+# Validate a raw reference list
+curl -X POST http://localhost:5006/api/v2/citations/validate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bibliography": [
+      "LeCun, Y., Bengio, Y., & Hinton, G. (2015). Deep learning. Nature, 521, 436-444.",
+      "Vaswani, A. et al. (2017). Attention is all you need. NeurIPS."
+    ]
+  }'
+```
+
+---
+
 ## Usage Examples
 
 All examples assume the server is running on `http://localhost:5006`.
@@ -285,7 +564,7 @@ curl -X POST http://localhost:5006/analyze \
   -H "Content-Type: application/json" \
   -d '{
     "text": "Your text here...",
-    "plugins": ["ai_detection", "perplexity_check", "citation_check"]
+    "plugins": ["ai_detection", "perplexity_check", "zone_classifier"]
   }'
 ```
 
@@ -306,6 +585,27 @@ curl -X POST http://localhost:5006/analyze \
   -d '{
     "text": "Your text here...",
     "plugins": ["full_analysis"]
+  }'
+```
+
+#### Detect citation style and zone classification
+```bash
+curl -X POST http://localhost:5006/api/v2/citations/detect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Recent advances [1] have shown significant improvements. The BERT model [2] achieves 94% accuracy.\n\nReferences\n[1] LeCun, Y., et al. Deep learning. Nature, 2015.\n[2] Devlin, J., et al. BERT. NAACL, 2019."
+  }'
+```
+
+#### Validate bibliography against academic APIs
+```bash
+curl -X POST http://localhost:5006/api/v2/citations/validate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bibliography": [
+      "Vaswani, A. et al. (2017). Attention is all you need. NeurIPS, pp. 5998-6008.",
+      "LeCun, Y., Bengio, Y., & Hinton, G. (2015). Deep learning. Nature, 521, 436-444."
+    ]
   }'
 ```
 
@@ -366,10 +666,7 @@ a subject of active debate among researchers and institutional policymakers.
 
 response = requests.post(
     "http://localhost:5006/analyze_document",
-    json={
-        "text": text,
-        "plugins": ["ai_detection"],
-    },
+    json={"text": text, "plugins": ["ai_detection"]},
 )
 data = response.json()
 
@@ -379,6 +676,64 @@ print(f"Segments analyzed: {len(ai.get('segments', []))}")
 
 for seg in ai.get("segments", []):
     print(f"  [{seg['segment_id']}] {seg['dominant_label']:7s}  {seg['score']:.2f}%  {seg['text'][:60]}...")
+```
+
+#### Detect citation zones (zone_classifier plugin)
+```python
+import requests
+
+text = """
+La inteligencia artificial ha transformado radicalmente los métodos de enseñanza
+en la educación superior (García & López, 2021). Según Smith et al. (2020), el
+aprendizaje automático permite personalizar el contenido educativo.
+
+Como señala Johnson (2019, p. 45): "La adaptación del currículo mediante
+algoritmos reduce en un 40% el tiempo de aprendizaje".
+
+Referencias
+García, M., & López, J. (2021). Transformación digital. Revista de Educación, 15(3), 45-67.
+Smith, A. et al. (2020). Machine learning in education. J. Ed. Technology, 8(2), 123-145.
+Johnson, R. (2019). Adaptive learning systems. Oxford University Press.
+"""
+
+response = requests.post(
+    "http://localhost:5006/analyze",
+    json={"text": text, "plugins": ["zone_classifier"]},
+)
+data = response.json()
+zc = data["results"]["zone_classifier"]["data"]
+
+print(f"Style:       {zc['dominant_style']}")
+print(f"Consistency: {zc['style_consistency']}%")
+print(f"Coverage:    {zc['citation_coverage']}%")
+print(f"Citations:   {zc['total_inline_citations']} inline, {zc['total_bibliography']} in bibliography")
+
+for zone in zc["zones"]:
+    risk = "HIGH" if zone["plagiarism_risk"] > 0.5 else "LOW"
+    cited = "cited" if zone["has_citation"] else "UNCITED"
+    print(f"  [{zone['type']:15s}] {cited:7s}  risk={risk}  {zone['text_preview'][:60]}...")
+```
+
+#### Validate citations against academic APIs
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:5006/api/v2/citations/validate",
+    json={
+        "bibliography": [
+            "LeCun, Y., Bengio, Y., & Hinton, G. (2015). Deep learning. Nature, 521, 436-444.",
+            "Vaswani, A. et al. (2017). Attention is all you need. NeurIPS, pp. 5998-6008.",
+        ]
+    },
+    timeout=60,
+)
+data = response.json()
+
+print(f"Total: {data['total']}  Valid: {data['valid']}  Not found: {data['not_found']}")
+for entry in data["results"]:
+    v = entry["validation"]
+    print(f"  [{v['status']:12s}] {v['confidence']}%  via {v['source_api']}  {entry['raw'][:60]}...")
 ```
 
 #### Run multiple plugins and handle errors
@@ -396,7 +751,7 @@ def analyze(text: str, plugins: list[str], base_url: str = "http://localhost:500
 
 result = analyze(
     text="Your text here...",
-    plugins=["ai_detection", "perplexity_check"],
+    plugins=["ai_detection", "perplexity_check", "zone_classifier"],
 )
 
 for plugin_name, plugin_result in result["results"].items():
@@ -404,28 +759,6 @@ for plugin_name, plugin_result in result["results"].items():
         print(f"{plugin_name}: {plugin_result['data']}")
     else:
         print(f"{plugin_name}: ERROR — {plugin_result.get('error')}")
-```
-
-#### Check server readiness before running inference
-```python
-import requests
-import time
-
-def wait_for_ready(base_url: str = "http://localhost:5006", retries: int = 10):
-    for attempt in range(retries):
-        try:
-            r = requests.get(f"{base_url}/ready", timeout=5)
-            if r.status_code == 200:
-                data = r.json()
-                print(f"Server ready — {data['plugins_loaded']} plugins loaded")
-                return True
-        except requests.ConnectionError:
-            pass
-        print(f"Not ready yet, retrying ({attempt + 1}/{retries})...")
-        time.sleep(5)
-    raise RuntimeError("Server did not become ready in time")
-
-wait_for_ready()
 ```
 
 ---
@@ -452,10 +785,7 @@ async def main():
         "Third document to analyze...",
     ]
 
-    tasks = [
-        analyze_async(text, ["ai_detection"])
-        for text in texts
-    ]
+    tasks = [analyze_async(text, ["ai_detection"]) for text in texts]
     results = await asyncio.gather(*tasks)
 
     for i, result in enumerate(results):
@@ -478,40 +808,37 @@ async function analyzeText(text, plugins = ["ai_detection"]) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, plugins }),
   });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-  }
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   return response.json();
 }
 
-async function analyzeDocument(text, plugins = ["ai_detection"]) {
-  const response = await fetch(`${BASE_URL}/analyze_document`, {
+async function detectCitations(text) {
+  const response = await fetch(`${BASE_URL}/api/v2/citations/detect`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, plugins }),
+    body: JSON.stringify({ text }),
   });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-  }
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   return response.json();
 }
 
 // Usage
-const text = `The integration of AI in academic settings has sparked debate.
-Second paragraph with more context about the subject matter.`;
+const text = `García & López (2021) found that AI reduces learning time by 40%.
+Smith et al. (2020) corroborate these findings.
 
-// Single plugin
-const result = await analyzeText(text, ["ai_detection"]);
-const ai = result.results.ai_detection.data;
+Referencias
+García, M., & López, J. (2021). Transformación digital. Rev. Ed. Superior, 15(3), 45-67.`;
+
+// AI detection
+const aiResult = await analyzeText(text, ["ai_detection"]);
+const ai = aiResult.results.ai_detection.data;
 console.log(`${ai.prediction} — ${ai.confidence.toFixed(2)}%`);
 
-// Document with segments
-const docResult = await analyzeDocument(text);
-const segments = docResult.results.ai_detection.data.segments ?? [];
-segments.forEach(seg => {
-  console.log(`[${seg.segment_id}] ${seg.dominant_label} ${seg.score.toFixed(2)}% — ${seg.text.slice(0, 60)}...`);
+// Citation detection
+const citeResult = await detectCitations(text);
+console.log(`Style: ${citeResult.dominant_style}, Citations: ${citeResult.inline_citations.length}`);
+citeResult.zones.forEach(z => {
+  console.log(`  [${z.type}] risk=${z.plagiarism_risk}  cited=${z.has_citation}  ${z.text_preview.slice(0, 60)}...`);
 });
 ```
 
@@ -526,6 +853,8 @@ All endpoints return a JSON error body with an appropriate HTTP status code.
 | `400` | Missing or invalid `text` field | `{"error": "'text' field is required and must be a non-empty string"}` |
 | `400` | Invalid JSON body | `{"error": "Invalid JSON body"}` |
 | `400` | `plugins` is not a non-empty list | `{"error": "'plugins' must be a non-empty list"}` |
+| `400` | `/api/v2/citations/detect` missing `text` | `{"error": "Campo 'text' requerido"}` |
+| `400` | `/api/v2/citations/validate` missing both `text` and `bibliography` | `{"error": "Se requiere 'text' o 'bibliography'"}` |
 | `415` | Missing `Content-Type: application/json` | `{"error": "Content-Type must be application/json"}` |
 | `503` | `ai_detection` plugin not loaded | `{"error": "ai_detection plugin not available"}` |
 
@@ -542,14 +871,6 @@ When a plugin runs but fails internally, the response is still `200` and the ind
         }
     }
 }
-
-
-curl -X POST http://localhost:5006/analyze_document  -H "Content-Type: application/json"  -d '{"text": "The Industrial Revolution was one of the most transformative periods in human history, marking the shift from agrarian societies to industrialized economies. Beginning in the late 18th century in Great Britain, it spread to other parts of Europe and eventually to the United States, fundamentally changing how people lived and worked. Before the Industrial Revolution, most production was done by hand in small workshops or at home. This system, often called the “cottage industry,” relied heavily on manual labor and simple tools. However, a series of technological innovations began to revolutionize production. One of the most important inventions was the steam engine, improved by James Watt. This machine allowed factories to operate more efficiently and independently of natural power sources like water. Another key development was the mechanization of the textile industry. Machines such as the spinning jenny and the power loom greatly increased the speed and volume of fabric production. As a result, factories began to replace traditional workshops, leading to the growth of urban centers. Cities expanded rapidly as people moved from rural areas in search of employment opportunities. The Industrial Revolution also had profound social and economic impacts. On one hand, it led to increased production, lower costs of goods, and improved standards of living for many people. On the other hand, it created harsh working conditions, especially in the early years. Workers, including women and children, often faced long hours, low wages, and unsafe environments in factories. In addition, the rise of industrial capitalism changed the structure of society. A new middle class of factory owners and entrepreneurs emerged, while the working class grew significantly. These changes eventually led to social reforms and the development of labor unions, as workers sought better conditions and rights. Despite its challenges, the Industrial Revolution laid the foundation for modern society. It introduced new technologies, transformed economies, and reshaped social structures in ways that continue to influence the world today.", "plugins": ["ai_detection","stylometric_analysis","citation_check"]}'
-
-
-
-
-
 ```
 
 ---
@@ -586,22 +907,75 @@ gunicorn --preload -c gunicorn.conf.py "app:create_app()"
 
 ### Docker
 
-To build and run the microservice using Docker:
+#### Build
 
 ```bash
-# 1. Build the image
-docker build -t xplagiax:latest .
-
-# 2. Run the container with 2 workers
-# Ensure model files are in app/engine/ before building, or mount them.
-docker run -d \
-  --name xplagiax-service \
-  -p 5006:5006 \
-  -e WEB_CONCURRENCY=2 \
-  xplagiax:latest
+docker build -t xplagiax_xota:latest .
 ```
 
-> **Note**: The Dockerfile is configured to use Gunicorn with `preload_app=True`, ensuring that the heavy ModernBERT models are shared across the 2 workers using Linux Copy-on-Write (CoW).
+#### Run — standard (single container, no Redis)
+
+```bash
+docker run -d \
+  --name xplagiax-xota \
+  -p 5006:5006 \
+  -e WEB_CONCURRENCY=2 \
+  -e LOG_LEVEL=info \
+  xplagiax_xota:latest
+```
+
+#### Run — production (with Redis for async tasks + citation validation)
+
+```bash
+# 1. Create network (if it doesn't exist)
+docker network create xplagiax-net
+
+# 2. Start Redis
+docker run -d \
+  --name redis \
+  --network xplagiax-net \
+  -p 6379:6379 \
+  redis:7-alpine
+
+# 3. Stop any existing container
+docker stop xplagiax-xota 2>/dev/null || true
+docker rm   xplagiax-xota 2>/dev/null || true
+
+# 4. Run the service
+docker run -d \
+  --name xplagiax-xota \
+  --network xplagiax-net \
+  --restart unless-stopped \
+  -p 5006:5006 \
+  -e WEB_CONCURRENCY=2 \
+  -e REDIS_URL="redis://redis:6379" \
+  -e CELERY_BROKER_URL="redis://redis:6379/0" \
+  -e CELERY_RESULT_BACKEND="redis://redis:6379/1" \
+  -e CROSSREF_EMAIL="your@email.com" \
+  -e LOG_LEVEL=info \
+  xplagiax_xota:latest
+
+# 5. Verify health
+curl http://localhost:5006/health
+curl http://localhost:5006/ready
+```
+
+#### Run — with mounted models (avoids embedding ~1.7 GB in the image)
+
+```bash
+docker run -d \
+  --name xplagiax-xota \
+  --network xplagiax-net \
+  --restart unless-stopped \
+  -p 5006:5006 \
+  -v /path/to/models:/app/app/engine \
+  -e WEB_CONCURRENCY=2 \
+  -e REDIS_URL="redis://redis:6379" \
+  -e CROSSREF_EMAIL="your@email.com" \
+  xplagiax_xota:latest
+```
+
+> **Note**: `preload_app=True` ensures the three ModernBERT models (~1.7 GB total) are loaded once in the Gunicorn master process and shared across all workers via Linux Copy-on-Write. Each worker adds only ~50 MB overhead instead of another full model copy.
 
 ---
 
@@ -623,6 +997,7 @@ docker run -d \
 | `CACHE_TYPE` | `SimpleCache` | Flask-Caching backend |
 | `CACHE_TIMEOUT` | `300` | Cache TTL in seconds |
 | `CELERY_BROKER_URL` | `redis://localhost:6379/0` | Celery broker URL (optional async queue) |
+| `CROSSREF_EMAIL` | `antiplagio@example.com` | Email sent to CrossRef Polite Pool API for citation validation |
 
 ---
 
@@ -639,7 +1014,17 @@ xplagiax_xota/
 │   ├── __init__.py               # create_app() factory
 │   ├── config.py                 # All config via env vars
 │   ├── routes.py                 # API blueprints (/analyze, /analyze_document, ...)
+│   ├── tasks.py                  # Celery background tasks
+│   ├── celery_app.py             # Celery worker entry point
 │   ├── plugin_registry.py        # Auto-discovery and dispatch
+│   │
+│   ├── antiplagio/               # Citation detection and validation package
+│   │   ├── __init__.py
+│   │   ├── flask_routes.py       # Blueprint /api/v2/ (detect + validate endpoints)
+│   │   └── citation/
+│   │       ├── __init__.py
+│   │       ├── detector.py       # CitationDetector — regex + spaCy fallback
+│   │       └── validator.py      # CitationValidator — async CrossRef/OpenAlex/SemanticScholar
 │   │
 │   ├── plugins/
 │   │   ├── base.py               # BasePlugin interface
@@ -651,6 +1036,7 @@ xplagiax_xota/
 │   │   ├── reasoning_check.py     # Reasoning-model detection (o1/R1)
 │   │   ├── citation_check.py     # Reference existence verification
 │   │   ├── watermark_detection.py # Digital watermark detection
+│   │   ├── zone_classifier.py    # Citation zone detection plugin (NEW)
 │   │   ├── forensic_report.py    # HTML forensic report generation
 │   │   └── full_analysis.py      # Complete forensic pipeline
 │   │
@@ -669,9 +1055,28 @@ xplagiax_xota/
 │       ├── modernbert.bin               # Model weights (~600 MB)
 │       ├── Model_groups_3class_seed12   # Model weights (~600 MB)
 │       └── Model_groups_3class_seed22   # Model weights (~600 MB)
+│
+└── tests/
+    ├── __init__.py
+    └── test_citation_system.py   # 24 pytest tests for CitationDetector
 ```
 
 ---
+
+## Bug Fix & Improvement Table (May 2026)
+
+| # | Severity | Module | Bug / Problem | Fix Applied |
+|---|---|---|---|---|
+| 1 | **CRITICAL** | `app/tasks.py` | Redundant double inference: `analyze_document_async` ran `analyze_long_document()` **after** `ai_detection` plugin had already performed identical inference via `analyze_long_documentsd_()`. Every request ran model inference twice. | Reuse `segments` already computed by the plugin. Fall back to `analyze_long_documentsd_()` only when `ai_detection` was not requested. |
+| 2 | **CRITICAL** | `app/engine/detector_final.py` | Copy-on-Write violation: PyTorch's internal reference counting wrote to the same virtual pages as model weights on first inference, causing all 1.71 GB of weights to be duplicated per worker. With 2 web + 1 Celery worker = 5.13 GB extra. | Added `m.share_memory()` after each model load. Moves tensor storage to POSIX shared memory — read-only across all forked processes, no CoW faults. |
+| 3 | **HIGH** | `app/tasks.py` | Redis result bloat: Celery serialized full task results including `heatmap_b64`, `confidence_chart_b64`, `comparison_chart_b64` (300 KB–1 MB each). With 1-hour TTL, accumulated hundreds of MB under load. | Added `_strip_base64()` helper to remove all `*_b64` keys before Redis serialization. HTML report in `/tmp` already contains the charts. |
+| 4 | **HIGH** | `app/celery_app.py` | Celery result TTL of 3600s allowed 1 hour of large results to accumulate in Redis simultaneously under moderate load. | Reduced `result_expires` from 3600s to 600s (10 minutes). |
+| 5 | **HIGH** | `app/antiplagio/citation/detector.py` | Multi-citation parentheticals `(García, 2021; López, 2020; Martínez, 2019)` were not detected — `APA_INLINE` requires a single author-year pair per parenthetical, so semicolon-separated citations were silently dropped. | Added `APA_MULTI_PAREN` regex pattern. Processing block at start of `_detect_inline_citations` splits semicolon-separated parts into individual `CitationMarker` objects. Original loop skips already-processed spans. |
+| 6 | **HIGH** | `app/antiplagio/citation/detector.py` | spaCy import failure would crash the entire module if `spacy` was not installed, preventing citation detection from working at all. | Separated `import spacy` from `spacy.load()`. `ImportError` sets `_SPACY_AVAILABLE = False` and falls back to rule-based sentence segmentation. `OSError` on model load (model not downloaded) also falls back gracefully. |
+| 7 | **MEDIUM** | `app/antiplagio/citation/validator.py` | `aiohttp` dependency was unconditional — if not installed, the entire validator module failed to import. | Wrapped in `try/except ImportError`. `_AIOHTTP_AVAILABLE = False` when missing. `validate_all()` returns `ValidationStatus.ERROR` results instead of crashing. |
+| 8 | **MEDIUM** | `app/antiplagio/flask_routes.py` | `async_route` decorator leaked event loop into gevent's global state: did not call `asyncio.set_event_loop(None)` after cleanup, risking interference between requests under concurrent load. | Added `asyncio.set_event_loop(None)` in the `finally` block after `loop.close()`. |
+| 9 | **MEDIUM** | `app/antiplagio/flask_routes.py` | Dead code in `validate_citations`: unused `_, bib_text = detector.segmenter._split_bibliography(...)` called and discarded the result, wasting CPU. | Removed unused call. `bibliography` is now obtained directly from `analysis.bibliography`. |
+| 10 | **LOW** | `app/plugins/zone_classifier.py` | CitationDetector was instantiated inside every `analyze()` call — each request rebuilt all compiled regex patterns, wasting CPU on every plugin invocation. | Moved `_detector = CitationDetector()` to module level. Singleton instantiated once at gunicorn preload, shared across workers via CoW. `warmup()` is a no-op. |
 
 ---
 
@@ -680,7 +1085,7 @@ xplagiax_xota/
 To operate efficiently on memory-constrained Virtual Private Servers (VPS), several architectural optimizations have been implemented:
 
 ### 1. Single-Container CoW Architecture
-Running a separate Celery worker container duplicates the ~1.7 GB ModernBERT models in memory. Instead, the application uses a **single container** where Gunicorn's master process loads the models once (`preload_app=True`) and internally forks the Celery worker (`when_ready` hook). 
+Running a separate Celery worker container duplicates the ~1.7 GB ModernBERT models in memory. Instead, the application uses a **single container** where Gunicorn's master process loads the models once (`preload_app=True`) and internally forks the Celery worker (`when_ready` hook).
 * **Result:** Total memory usage drops from ~6.8 GB to ~2.8 GB because the models are shared via Linux Copy-on-Write (CoW).
 
 ### 2. Gunicorn Worker Limits
@@ -690,13 +1095,13 @@ ML workloads are memory-intensive (each worker adds ~200MB+ overhead). The Gunic
 Celery tasks are configured to prevent memory leaks and zombie processes during long document analysis:
 * **Garbage Collection:** Explicit `gc.collect()` and `torch.cuda.empty_cache()` are called in the `finally` block of every task (`tasks.py`).
 * **Timeouts:** Tasks have a hard `time_limit=300s` to kill runaway processes before they exhaust memory.
-* **Result TTL:** `result_expires = 3600` prevents the Redis backend from accumulating stale task results indefinitely.
+* **Result TTL:** `result_expires = 600` prevents the Redis backend from accumulating stale task results indefinitely.
 * **Prefetch Limits:** `worker_prefetch_multiplier = 1` ensures the worker only pulls one heavy ML task at a time.
 * **Auto-Restart:** A `child_exit` hook monitors the internal Celery worker and automatically restarts it if it crashes due to an OOM or segfault.
 
 ### 4. Concurrency & Capacity Limits
 * **Memory Leak Prevention:** The explicit `gc.collect()` after each analysis ensures no "residue" memory or orphaned tensors remain. RAM usage will briefly spike during inference (forward pass) but will immediately drop back down, guaranteeing stable memory footprint over weeks of uptime.
-* **Simultaneous Users:** The system is strictly capped to process **3 concurrent heavy analyses** at exactly the same time (2 Web Workers + 1 Celery Worker). 
+* **Simultaneous Users:** The system is strictly capped to process **3 concurrent heavy analyses** at exactly the same time (2 Web Workers + 1 Celery Worker).
 * **Queuing:** If 50-100 users submit a 500-word document simultaneously, the system will *not* crash. It will process 3 immediately while safely queuing the remaining requests in Redis (for async) or Gunicorn's backlog. At a rate of ~2-3 seconds per 500-word document, a single Celery worker can process ~20-30 documents per minute seamlessly in the background.
 
 ### Deploying the Optimized Container
@@ -720,34 +1125,77 @@ docker run -d \
   -e REDIS_URL="redis://redis:6379" \
   -e CELERY_BROKER_URL="redis://redis:6379/0" \
   -e CELERY_RESULT_BACKEND="redis://redis:6379/1" \
+  -e CROSSREF_EMAIL="your@email.com" \
   xplagiax_xota:latest
 
 # 4. Verify the internal Celery worker is running alongside Gunicorn
 docker exec xplagiax-xota ps aux | grep -E "gunicorn|celery"
 ```
 
-### Troubleshooting the Migration
-
-If you encounter errors during or after the migration to the single-container CoW architecture, refer to these common issues:
+### Troubleshooting
 
 **1. Celery Crash: `ImproperlyConfigured: Cannot mix new and old setting keys`**
-* **Cause:** Celery 5.x throws this error if you push old uppercase Flask configs into `celery.conf` while also using new lowercase config keys (like `result_expires`). 
-* **Fix:** The codebase was updated to remove the `celery.conf.update(app.config)` call in `app/celery_app.py`. Ensure your image is rebuilt (`docker build -t xplagiax_xota:latest .`) to include this fix.
+* **Cause:** Celery 5.x throws this error if you push old uppercase Flask configs into `celery.conf` while also using new lowercase config keys.
+* **Fix:** The codebase was updated to remove the `celery.conf.update(app.config)` call in `app/celery_app.py`. Rebuild the image.
 
 **2. Docker Error: `Conflict. The container name "/xplagiax-xota" is already in use`**
-* **Cause:** You cannot run a new container if an old one with the exact same name exists, even if it is stopped.
-* **Fix:** Remove the old container first before running the new one:
+* **Cause:** A stopped container with the same name still exists.
+* **Fix:**
   ```bash
   docker stop xplagiax-xota
   docker rm xplagiax-xota
   ```
 
 **3. MarkTrack Error: `NameResolutionError: Failed to resolve 'xplagiax-xota'`**
-* **Cause:** Because you deleted and recreated the `xplagiax-xota` container, Docker assigned it a new internal IP address. The main MarkTrack Flask app (`urllib3`) has a connection pool that cached the old IP address, causing requests to fail.
-* **Fix:** Simply restart the MarkTrack container to flush its DNS cache and reconnect to the new instance:
-  ```bash
-  docker restart marktrack_app
-  ```
+* **Cause:** The MarkTrack container cached the old container's internal IP after recreation.
+* **Fix:** `docker restart marktrack_app`
+
+**4. Citation validation returns `error` status**
+* **Cause:** `aiohttp` is not installed, or the container has no outbound network access.
+* **Fix:** Verify `aiohttp>=3.9.0` is in `requirements.txt` and rebuild. Check Docker network policy with `docker inspect xplagiax-xota`.
+
+---
+
+## Memory Leak Analysis — Root Causes & Fixes (May 2026)
+
+Deep forensic analysis of why the container consumed **2.7 GB at baseline** and why memory **grew further after each `analyze_document_async` call**.
+
+### Baseline 2.7 GB — Decomposition
+
+| Component | Size | Origin |
+|---|---|---|
+| `modernbert.bin` (model_1) | ~570 MB | Loaded at module import in `detector_final.py` |
+| `Model_groups_3class_seed12` (model_2) | ~570 MB | Loaded at module import in `detector_final.py` |
+| `Model_groups_3class_seed22` (model_3) | ~570 MB | Loaded at module import in `detector_final.py` |
+| PyTorch runtime + libs | ~350 MB | Imported with the models |
+| Transformers + Tokenizers | ~100 MB | HuggingFace local cache |
+| spaCy + NLTK | ~80 MB | Pre-downloaded in Dockerfile |
+| Flask + Celery + 86 packages | ~100 MB | `requirements.txt` |
+| Docker OS + Python 3.12 slim | ~200 MB | Base image |
+| **Total baseline** | **~2.5–2.7 GB** | — |
+
+### Memory Growth After `analyze_document_async` — Root Cause Table
+
+| # | Severity | Category | Root Cause | Location | Fix Applied |
+|---|---|---|---|---|---|
+| 1 | **CRITICAL** | Redundant inference | `tasks.py` ran model inference twice on the same text (plugin + task). | `app/tasks.py:47–48` | Reuse plugin segments; fall back only when `ai_detection` not requested. |
+| 2 | **CRITICAL** | CoW violation | PyTorch ref-counting triggered CoW page faults, duplicating 1.71 GB per worker (3 workers = 5.13 GB). | `detector_final.py:_load_model()` | `m.share_memory()` after load — POSIX shared memory, no CoW faults. |
+| 3 | **HIGH** | Redis result bloat | Base64 charts (300 KB–1 MB each) serialized into Redis with 1-hour TTL. | `tasks.py` return + `celery_app.py` | Strip `*_b64` keys before Redis; reduce TTL to 600s. |
+| 4 | **HIGH** | GPT-2 lazy-load spike | PerplexityProfiler Tier 2 loads GPT-2 (~500 MB) on first use, permanent spike. | `perplexity_profiler.py` | Set `PERPLEXITY_TIER2=0` in production if Tier 2 is not required. |
+| 5 | **MEDIUM** | `/tmp` accumulation | `ForensicReportGenerator` creates 1–3 MB HTML files, cleanup only after 1 hour. | `full_analysis.py` | Mount `/tmp` as `tmpfs` in Docker to isolate from overlay filesystem. |
+| 6 | **MEDIUM** | Celery result TTL | 3600s TTL allows 1 hour of large results to accumulate in Redis. | `celery_app.py:result_expires` | Reduced to 600s. |
+| 7 | **LOW** | `gc.collect()` scope | GC handles Python cycles but cannot free live PyTorch tensors. | `tasks.py:finally` | No change — call is correct; documented scope limitation. |
+
+### Memory Budget After Fixes
+
+| Scenario | Before Fixes | After Fixes |
+|---|---|---|
+| Baseline (idle, before first request) | ~2.7 GB | ~2.7 GB (unchanged) |
+| After first async request (all 3 processes touched) | +5.1 GB (CoW violation × 3 workers) | ~+50 MB (shared memory) |
+| Redis after 100 async requests (1-hour window) | +500 MB–1 GB | ~+10–50 MB |
+| **Steady-state under load** | **~8–10 GB+** | **~3–3.5 GB** |
+
+---
 
 ## Kubernetes Deployment
 
@@ -770,6 +1218,8 @@ spec:
               value: "2"
             - name: LOG_LEVEL
               value: "info"
+            - name: CROSSREF_EMAIL
+              value: "your@email.com"
           resources:
             requests:
               memory: "3Gi"

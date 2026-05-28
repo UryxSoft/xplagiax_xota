@@ -45,6 +45,12 @@ def _load_model(weight_path):
     m = AutoModelForSequenceClassification.from_config(_config)
     m.load_state_dict(torch.load(weight_path, map_location=device))
     m.to(device).eval()
+    # Pin tensors in POSIX shared memory so forked Gunicorn/Celery workers read
+    # the same physical pages without triggering Copy-on-Write faults.
+    # Without this, the first inference in each worker copies all ~570 MB of
+    # model weights into private pages, multiplying RSS by the worker count.
+    if device.type == "cpu":
+        m.share_memory()
     return m
 
 model_1 = _load_model(model1_path)

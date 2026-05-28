@@ -16,8 +16,10 @@ def make_celery():
     )
 
     # ── Cleanup settings ─────────────────────────────────────────────────────
-    # Auto-delete task results from Redis after 1 hour (prevents Redis bloat)
-    celery.conf.result_expires = 3600
+    # Auto-delete task results from Redis after 10 min.
+    # The previous 1-hour TTL allowed hundreds of large results (each with
+    # base64 charts) to accumulate in Redis simultaneously under load.
+    celery.conf.result_expires = 600
     # ACK the task only after it completes — re-queues on worker crash
     celery.conf.task_acks_late = True
     # Prefetch 1 task at a time (important for memory-heavy ML tasks)
