@@ -31,6 +31,15 @@ from app.plugins.base import BasePlugin
 
 logger = logging.getLogger(__name__)
 
+# ── CitationDetector singleton (CoW-safe, no network) ────────────
+_citation_detector = None
+try:
+    from app.antiplagio.citation.detector import CitationDetector, ZoneType
+    _citation_detector = CitationDetector()
+    logger.info("CitationDetector loaded for full_analysis")
+except Exception as _exc:
+    logger.warning("CitationDetector unavailable for full_analysis: %s", _exc)
+
 # ── Module-level engine loading (shared via CoW) ──────────────────
 _orchestrator = None
 _PluginConfig = None
@@ -166,6 +175,32 @@ class FullAnalysisPlugin(BasePlugin):
                 "risk_level": rc.get("risk_level", "N/A"),
                 "total_references": rc.get("total_references", 0),
             }
+
+        # Zone classification (fast, no network)
+        if _citation_detector is not None:
+            try:
+                cit = _citation_detector.analyze(text)
+                response["zone_analysis"] = {
+                    "dominant_style": cit.dominant_style.value,
+                    "style_consistency": round(cit.style_consistency * 100, 1),
+                    "citation_coverage": round(cit.citation_coverage * 100, 1),
+                    "total_inline_citations": len(cit.inline_citations),
+                    "total_bibliography": len(cit.bibliography),
+                    "orphan_citations": len(cit.orphan_citations),
+                    "uncited_bibliography": len(cit.uncited_bibliography),
+                    "zones": [
+                        {
+                            "type": z.zone_type.value,
+                            "has_citation": z.has_valid_citation,
+                            "plagiarism_risk": round(z.plagiarism_risk, 2),
+                            "text_preview": z.text[:120],
+                        }
+                        for z in cit.zones
+                        if z.zone_type != ZoneType.BIBLIOGRAPHY
+                    ],
+                }
+            except Exception as exc:
+                logger.warning("Zone analysis failed in full_analysis: %s", exc)
 
         # Plain-text summary
         response["summary"] = _orchestrator.summary(result)
