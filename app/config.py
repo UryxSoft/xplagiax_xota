@@ -36,5 +36,8 @@ class Config:
     # ── API Security ───────────────────────────────────────────────
     API_KEY = os.environ.get("API_KEY", "")  # empty = auth disabled
 
+    # ── Antiplagio / Citation validator ────────────────────────────
+    CROSSREF_EMAIL = os.environ.get("CROSSREF_EMAIL", "antiplagio@example.com")
+
     # ── Logging ────────────────────────────────────────────────────
     LOG_LEVEL = "INFO"

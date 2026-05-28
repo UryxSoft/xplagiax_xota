@@ -9,6 +9,27 @@ from app.celery_app import celery
 
 logger = logging.getLogger(__name__)
 
+_B64_KEYS = frozenset({"heatmap_b64", "confidence_chart_b64", "comparison_chart_b64"})
+
+
+def _strip_base64(results: dict) -> dict:
+    """
+    Remove base64-encoded chart images from plugin results before Redis serialization.
+    Each chart is ~300 KB–1 MB of base64 text; keeping them in Redis for up to 1 hour
+    wastes significant memory per task. The HTML report file in /tmp already contains
+    the charts — the client should fetch /report/<id> for the visual output.
+    """
+    for plugin_result in results.values():
+        if not isinstance(plugin_result, dict):
+            continue
+        data = plugin_result.get("data")
+        if isinstance(data, dict):
+            for key in _B64_KEYS:
+                if key in data:
+                    data[key] = None
+    return results
+
+
 @celery.task(
     bind=True,
     name="analyze_document_task",
@@ -26,6 +47,7 @@ def analyze_document_task(self, payload):
     - gc.collect() is called after each run to free Python-managed objects.
     - torch cache is cleared to prevent GPU/CPU tensor accumulation.
     - time_limit=300s kills runaway tasks before they OOM the worker.
+    - base64 chart images are stripped before Redis serialization.
     """
     t0 = time.perf_counter()
 
@@ -40,14 +62,33 @@ def analyze_document_task(self, payload):
         # 1. Run standard plugins
         results = registry.run(plugins_requested, text, timeout=timeout)
 
-        # 2. Run heavy segmentation
+        # 2. Obtain per-segment breakdown.
+        # Reuse segments already computed by the ai_detection plugin when possible —
+        # avoids running the full batch inference a second time for the same text.
         doc_result = {}
-        try:
-            import app.engine
-            from detector_final import analyze_long_document
-            doc_result = analyze_long_document(text, max_tokens=max_tokens)
-        except Exception as exc:
-            logger.warning("analyze_long_document failed in task: %s", exc)
+        ai_plugin_data = (results.get("ai_detection") or {})
+        if ai_plugin_data.get("status") == "ok":
+            ai_data = ai_plugin_data.get("data", {})
+            segs = ai_data.get("segments", [])
+            if segs:
+                doc_result = {
+                    "segments": segs,
+                    "overall_summary": {
+                        "total_human_percentage": ai_data.get("human_percentage", 50),
+                        "total_ai_percentage": ai_data.get("ai_percentage", 50),
+                        "overall_prediction": ai_data.get("prediction", "Unknown"),
+                    },
+                }
+
+        if not doc_result:
+            # Fallback: ai_detection was not requested or returned no segments.
+            # Use the lightweight segmentation path (no orchestrator plugins per segment).
+            try:
+                import app.engine
+                from detector_final import analyze_long_documentsd_ as _seg_fn
+                doc_result = _seg_fn(text, max_tokens=max_tokens)
+            except Exception as exc:
+                logger.warning("analyze_long_documentsd_ failed in task: %s", exc)
 
         segments = doc_result.get("segments", [])
 
@@ -56,11 +97,11 @@ def analyze_document_task(self, payload):
             ai_result = results["ai_detection"]
             if ai_result.get("status") == "ok" and isinstance(ai_result.get("data"), dict):
                 ai_result["data"]["segments"] = segments
-                
+
                 summary = doc_result.get("overall_summary", {})
                 ai_result["data"]["overall_summary"] = summary
-                
-                # Sincronizamos los porcentajes de la raíz para que el frontend vea 
+
+                # Sincronizamos los porcentajes de la raíz para que el frontend vea
                 # el porcentaje exacto tras la validación forense
                 if summary:
                     ai_result["data"]["human_percentage"] = summary.get("total_human_percentage", 50)
@@ -74,7 +115,7 @@ def analyze_document_task(self, payload):
             "status": "ok",
             "word_count": len(text.split()),
             "plugins_requested": plugins_requested,
-            "results": results,
+            "results": _strip_base64(results),
             "total_elapsed_ms": round(elapsed * 1000, 1),
         }
 

@@ -36,6 +36,9 @@ def create_app() -> Flask:
     from app.routes import api_bp
     app.register_blueprint(api_bp)
 
+    from app.antiplagio.flask_routes import register_antiplagio_routes
+    register_antiplagio_routes(app)
+
     # ── Startup log ────────────────────────────────────────────────
     app.logger.info(
         "TextAnalyzer ready — %d plugins: %s",
