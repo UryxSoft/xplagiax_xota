@@ -15,7 +15,7 @@ from functools import wraps
 from flask import Blueprint, request, jsonify, current_app
 
 from .citation.detector import CitationDetector, CitationStyle, ZoneType
-from .citation.validator import CitationValidator, ValidationStatus
+from .citation.validator import CitationValidator, ValidationStatus, _shared_cache
 
 
 antiplagio_bp = Blueprint("antiplagio", __name__, url_prefix="/api/v2")
@@ -138,7 +138,8 @@ async def validate_citations():
         }), 200
 
     validator = CitationValidator(
-        crossref_email=current_app.config.get("CROSSREF_EMAIL", "antiplagio@example.com")
+        crossref_email=current_app.config.get("CROSSREF_EMAIL", "antiplagio@example.com"),
+        cache=_shared_cache,
     )
     validation_results = await validator.validate_all(bibliography)
 

@@ -23,6 +23,8 @@ Note: ValidationCache is in-memory with 24h TTL.
 import asyncio
 import hashlib
 import logging
+import os
+import pickle
 import re
 import time
 from dataclasses import dataclass, field
@@ -88,30 +90,77 @@ class ValidationResult:
 
 
 # ─────────────────────────────────────────────
-# Cache (in-memory, replace with Redis for production)
+# Cache — Redis when available, in-memory fallback
 # ─────────────────────────────────────────────
 
 class ValidationCache:
-    """TTL cache for validation results (avoids repeating costly API calls)."""
+    """
+    TTL cache for validation results.
 
-    def __init__(self, ttl_seconds: int = 86400):  # 24h default
-        self._cache: dict = {}
+    Uses Redis when REDIS_URL is set and reachable — results are shared
+    across all Gunicorn workers and persist across restarts.
+    Falls back to a per-process in-memory dict when Redis is unavailable.
+    """
+
+    _REDIS_PREFIX = "vcache:"
+
+    def __init__(self, ttl_seconds: int = 86400, redis_url: Optional[str] = None):
         self.ttl = ttl_seconds
+        self._mem: dict = {}
+        self._redis = None
+
+        url = redis_url or os.environ.get("REDIS_URL")
+        if url:
+            try:
+                import redis as _redis_lib
+                client = _redis_lib.from_url(url, socket_timeout=2, socket_connect_timeout=2)
+                client.ping()
+                self._redis = client
+                logger.info("ValidationCache: Redis backend at %s", url)
+            except Exception as exc:
+                logger.warning("ValidationCache: Redis unavailable (%s), using in-memory", exc)
+
+    # ── public interface ──────────────────────────────────────────
 
     def get(self, key: str) -> Optional[ValidationResult]:
-        if key in self._cache:
-            result, timestamp = self._cache[key]
-            if time.time() - timestamp < self.ttl:
+        if self._redis is not None:
+            try:
+                raw = self._redis.get(self._REDIS_PREFIX + key)
+                if raw:
+                    return pickle.loads(raw)
+                return None
+            except Exception as exc:
+                logger.debug("ValidationCache Redis get failed: %s", exc)
+
+        entry = self._mem.get(key)
+        if entry:
+            result, ts = entry
+            if time.time() - ts < self.ttl:
                 return result
-            del self._cache[key]
+            del self._mem[key]
         return None
 
     def set(self, key: str, result: ValidationResult) -> None:
-        self._cache[key] = (result, time.time())
+        if self._redis is not None:
+            try:
+                self._redis.setex(self._REDIS_PREFIX + key, self.ttl, pickle.dumps(result))
+                return
+            except Exception as exc:
+                logger.debug("ValidationCache Redis set failed: %s", exc)
+
+        self._mem[key] = (result, time.time())
 
     def _make_key(self, entry: BibliographyEntry) -> str:
         data = f"{entry.authors}{entry.year}{entry.title}{entry.doi}"
         return hashlib.md5(data.encode()).hexdigest()
+
+
+# Module-level singleton — shared across all requests in the same worker.
+# Redis backend (if configured) shares state across all workers.
+_shared_cache: ValidationCache = ValidationCache(
+    ttl_seconds=86400,
+    redis_url=os.environ.get("REDIS_URL"),
+)
 
 
 # ─────────────────────────────────────────────
@@ -318,12 +367,14 @@ class CitationValidator:
         self,
         crossref_email: str = "antiplagio@example.com",
         cache_ttl: int = 86400,
-        max_concurrent: int = 5
+        max_concurrent: int = 5,
+        cache: Optional[ValidationCache] = None,
     ):
         self.crossref = CrossRefClient(email=crossref_email)
         self.openalex = OpenAlexClient(email=crossref_email)
         self.semantic = SemanticScholarClient()
-        self.cache = ValidationCache(ttl_seconds=cache_ttl)
+        # Use provided cache (e.g. module-level singleton) or create a local one
+        self.cache = cache if cache is not None else _shared_cache
         self.semaphore_limit = max_concurrent
 
     async def validate_all(self, entries: list) -> dict:
