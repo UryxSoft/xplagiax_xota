@@ -131,6 +131,12 @@ def child_exit(server, worker):
 
 def post_fork(server, worker):
     """Called just after a worker has been forked."""
+    global _celery_process
+    # The Celery process belongs to the master, not to this worker.
+    # Nulling the reference prevents Python's multiprocessing atexit handler
+    # from calling join() on a process the worker doesn't own, which would
+    # raise: AssertionError: can only join a child process
+    _celery_process = None
     server.log.info("Worker spawned — PID %s", worker.pid)
 
 def worker_exit(server, worker):

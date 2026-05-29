@@ -366,7 +366,7 @@ def analyze_long_document(long_text: str, orchestrator=None, max_tokens: int = 5
     print(f"\nIniciando análisis forense de {len(chunks_text)} segmentos...")
     
     # 2. Procesamiento de Segmentos por Lotes (Batch size = 4)
-    BATCH_SIZE = 4
+    BATCH_SIZE = 8
     for i in range(0, len(chunks_text), BATCH_SIZE):
         batch_slice = chunks_text[i:i + BATCH_SIZE]
         batch_results = classify_batch(batch_slice)
@@ -476,7 +476,7 @@ def analyze_long_documentsd_(long_text: str, max_tokens: int = 512) -> dict:
     print(f"\nIniciando análisis semántico de {len(chunks_text)} segmentos...")
     
     # 4. Procesar por lotes (Batch size = 4)
-    BATCH_SIZE = 4
+    BATCH_SIZE = 8
     for i in range(0, len(chunks_text), BATCH_SIZE):
         batch_slice = chunks_text[i:i + BATCH_SIZE]
         batch_results = classify_batch(batch_slice)

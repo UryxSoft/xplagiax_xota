@@ -37,9 +37,10 @@ class AIDetectionPlugin(BasePlugin):
         if not _available:
             return {"error": "ModernBERT models not loaded. Check model paths."}
 
-        # Ejecutamos el análisis segmentado que ya tienes en detector_final.py
-        # max_tokens=150 asegura fragmentación en párrafos u oraciones lógicas.
-        doc_result = _analyze_text(text, max_tokens=150)
+        # max_tokens=512 matches ModernBERT's effective context window and
+        # reduces chunk count for long documents (e.g. 1600-word text goes from
+        # ~14 chunks to ~5), cutting inference batches roughly in half.
+        doc_result = _analyze_text(text, max_tokens=512)
         
         if "error" in doc_result:
             return {"error": doc_result["error"]}
