@@ -53,7 +53,6 @@ def analyze_document_task(self, payload):
 
     text = payload.get("text", "")
     plugins_requested = payload.get("plugins", ["ai_detection"])
-    max_tokens = int(payload.get("max_tokens", 150))
 
     registry = current_app.config["PLUGIN_REGISTRY"]
     timeout = current_app.config.get("PLUGIN_TIMEOUT", 120)
@@ -82,13 +81,13 @@ def analyze_document_task(self, payload):
 
         if not doc_result:
             # Fallback: ai_detection was not requested or returned no segments.
-            # Use the lightweight segmentation path (no orchestrator plugins per segment).
+            # analyze_fast uses adaptive max_tokens — no argument needed.
             try:
                 import app.engine
-                from detector_final import analyze_long_documentsd_ as _seg_fn
-                doc_result = _seg_fn(text, max_tokens=max_tokens)
+                from detector_final import analyze_fast as _seg_fn
+                doc_result = _seg_fn(text)
             except Exception as exc:
-                logger.warning("analyze_long_documentsd_ failed in task: %s", exc)
+                logger.warning("analyze_fast failed in task: %s", exc)
 
         segments = doc_result.get("segments", [])
 

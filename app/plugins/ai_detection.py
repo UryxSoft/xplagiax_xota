@@ -1,8 +1,8 @@
 """
 app/plugins/ai_detection.py — Quick AI vs Human classification.
 
-Wraps detector_final.analyze_long_documentsd_ for fast binary detection
-with semantic segmentation and global percentage calculation.
+Uses detector_final.analyze_fast for adaptive-chunk inference:
+single tokenization pass, BATCH_SIZE=12, max_tokens auto-scaled by word count.
 """
 
 import logging
@@ -17,10 +17,10 @@ _available = False
 
 try:
     import app.engine  # noqa
-    from detector_final import analyze_long_documentsd_
-    _analyze_text = analyze_long_documentsd_
+    from detector_final import analyze_fast
+    _analyze_text = analyze_fast
     _available = True
-    logger.info("ModernBERT 4-model ensemble loaded for AI detection (Segmented)")
+    logger.info("ModernBERT ensemble loaded for AI detection (analyze_fast)")
 except Exception as exc:
     logger.warning("detector_final not available: %s", exc)
 
@@ -37,10 +37,7 @@ class AIDetectionPlugin(BasePlugin):
         if not _available:
             return {"error": "ModernBERT models not loaded. Check model paths."}
 
-        # max_tokens=512 matches ModernBERT's effective context window and
-        # reduces chunk count for long documents (e.g. 1600-word text goes from
-        # ~14 chunks to ~5), cutting inference batches roughly in half.
-        doc_result = _analyze_text(text, max_tokens=512)
+        doc_result = _analyze_text(text)
         
         if "error" in doc_result:
             return {"error": doc_result["error"]}

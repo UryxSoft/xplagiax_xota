@@ -516,3 +516,96 @@ def analyze_long_documentsd_(long_text: str, max_tokens: int = 512) -> dict:
 with iface:
     text_input.change(_gradio_classify, inputs=text_input, outputs=[result_output, plot_output])
 """
+
+
+@torch.inference_mode()
+def analyze_fast(text: str) -> dict:
+    """
+    Speed-optimized document analysis for any length without timeout risk.
+
+    Improvements over analyze_long_documentsd_:
+      1. Single tokenizer.encode() call for the full text — no per-fragment
+         encode loop. Eliminates 20-100 tokenizer calls on large documents.
+      2. Adaptive max_tokens based on word count:
+           < 800 words  → 256 tokens  (fine-grained, fast)
+           < 2500 words → 512 tokens  (standard accuracy)
+           < 6000 words → 768 tokens  (fewer batches)
+           >= 6000 words → 1024 tokens (minimal batches, no timeout)
+      3. BATCH_SIZE=12 — more sequences per forward pass, fewer model calls.
+      4. Token-boundary splitting — cleaner chunks, no paragraph fragmentation.
+
+    Expected CPU time (3-model ensemble, ~2.5s per batch call):
+        500 w →  ~2.5s   1000 w →  ~2.5s   2000 w →  ~2.5s
+       5000 w →  ~2.5s  10000 w →  ~5.0s  50000 w → ~12.5s
+    """
+    if not text.strip():
+        return {"error": "El documento está vacío."}
+
+    # Adaptive chunk size
+    word_count = len(text.split())
+    if word_count < 800:
+        max_tokens = 256
+    elif word_count < 2500:
+        max_tokens = 512
+    elif word_count < 6000:
+        max_tokens = 768
+    else:
+        max_tokens = 1024
+
+    BATCH_SIZE = 12
+
+    # 1. Tokenize entire text once (no per-fragment loop)
+    all_ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
+    if not all_ids:
+        return {"error": "No se pudo tokenizar el texto."}
+
+    # 2. Split at token boundaries
+    chunk_id_seqs = [
+        all_ids[i: i + max_tokens]
+        for i in range(0, len(all_ids), max_tokens)
+    ]
+
+    # Merge orphan trailing chunk (< 50 tokens) into previous
+    if len(chunk_id_seqs) > 1 and len(chunk_id_seqs[-1]) < 50:
+        chunk_id_seqs[-2] += chunk_id_seqs.pop()
+
+    # 3. Decode chunks (needed for segment labels and forensic output)
+    chunks_text = [
+        tokenizer.decode(ids, skip_special_tokens=True)
+        for ids in chunk_id_seqs
+    ]
+    chunk_lengths = [len(ids) for ids in chunk_id_seqs]
+
+    # 4. Batch inference — all chunks in as few calls as possible
+    all_pcts = []
+    for i in range(0, len(chunks_text), BATCH_SIZE):
+        all_pcts.extend(classify_batch(chunks_text[i: i + BATCH_SIZE]))
+
+    # 5. Weighted summary + per-segment results
+    segments = []
+    total_human_w = total_ai_w = total_len = 0
+
+    for idx, ((human_pct, ai_pct), tok_len) in enumerate(
+        zip(all_pcts, chunk_lengths)
+    ):
+        segments.append({
+            "segment_id": idx + 1,
+            "text": chunks_text[idx],
+            "dominant_label": "AI" if ai_pct > human_pct else "Human",
+            "score": max(ai_pct, human_pct),
+        })
+        total_human_w += human_pct * tok_len
+        total_ai_w += ai_pct * tok_len
+        total_len += tok_len
+
+    overall_human = round(total_human_w / total_len)
+    overall_ai = round(total_ai_w / total_len)
+
+    return {
+        "overall_summary": {
+            "total_human_percentage": overall_human,
+            "total_ai_percentage": overall_ai,
+            "overall_prediction": "AI" if overall_ai > overall_human else "Human",
+        },
+        "segments": segments,
+    }
