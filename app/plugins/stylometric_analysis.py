@@ -16,8 +16,7 @@ _profiler = None
 _available = False
 
 try:
-    import app.engine  # noqa
-    from stylometric_profiler import StylometricProfiler
+    from app.engine.stylometric_profiler import StylometricProfiler
     _profiler = StylometricProfiler()
     _available = True
     logger.info("StylometricProfiler loaded")

@@ -142,10 +142,15 @@ class NgramDictionary:
 
     def __init__(self, dict_path: Optional[str] = None) -> None:
         self._external_freqs: Optional[Dict[str, Dict[str, float]]] = None
+        self._external_totals: Dict[str, float] = {}
+        self._external_vocab: Dict[str, int] = {}
         if dict_path and os.path.exists(dict_path):
             try:
                 with open(dict_path, "r", encoding="utf-8") as f:
                     self._external_freqs = json.load(f)
+                for _key, _freq in self._external_freqs.items():
+                    self._external_totals[_key] = float(sum(_freq.values()))
+                    self._external_vocab[_key] = max(len(_freq), 1)
                 logger.info("Loaded n-gram dictionary from %s", dict_path)
             except Exception as exc:
                 logger.warning("Failed to load n-gram dict: %s", exc)
@@ -178,8 +183,8 @@ class NgramDictionary:
                 if len(tokens) < n or str(n) not in self._external_freqs:
                     continue
                 freq = self._external_freqs[str(n)]
-                vocab_size = max(len(freq), 1)
-                total_ngrams = sum(freq.values())
+                vocab_size = self._external_vocab.get(str(n), max(len(freq), 1))
+                total_ngrams = self._external_totals.get(str(n), float(sum(freq.values())))
                 for i in range(len(tokens) - n + 1):
                     ngram = " ".join(tokens[i:i + n])
                     count = freq.get(ngram, 0)
@@ -238,13 +243,12 @@ class NgramDictionary:
         return float(np.clip(ppl, 1.0, 15.0))
 
     @staticmethod
-    def _build_ngram_freq(tokens: List[str], n: int) -> Dict[str, int]:
-        """Build frequency dict for n-grams from token list."""
-        freq: Dict[str, int] = Counter()
+    def _build_ngram_freq(tokens: List[str], n: int) -> Counter:
+        """Build n-gram frequency Counter from token list."""
+        freq: Counter = Counter()
         for i in range(len(tokens) - n + 1):
-            ngram = " ".join(tokens[i:i + n])
-            freq[ngram] += 1
-        return dict(freq)
+            freq[" ".join(tokens[i:i + n])] += 1
+        return freq
 
     def build_and_save(self, corpus_texts: List[str], output_path: str,
                        orders: Tuple[int, ...] = _NGRAM_ORDERS,
@@ -259,16 +263,19 @@ class NgramDictionary:
         orders       : n-gram orders to compute
         top_k        : keep only the top_k most frequent n-grams per order
         """
-        all_freqs: Dict[str, Dict[str, int]] = {}
+        counters: Dict[int, Counter] = {n: Counter() for n in orders}
 
-        for n in orders:
-            merged: Dict[str, int] = Counter()
-            for text in corpus_texts:
-                tokens = self._tokenize(text)
+        for text in corpus_texts:
+            tokens = self._tokenize(text)
+            for n in orders:
+                if len(tokens) < n:
+                    continue
                 for i in range(len(tokens) - n + 1):
-                    ngram = " ".join(tokens[i:i + n])
-                    merged[ngram] += 1
-            top = dict(merged.most_common(top_k))
+                    counters[n][" ".join(tokens[i:i + n])] += 1
+
+        all_freqs: Dict[str, Dict[str, int]] = {}
+        for n in orders:
+            top = dict(counters[n].most_common(top_k))
             all_freqs[str(n)] = top
             logger.info("Built %d-gram dict: %d entries (kept top %d)", n, len(top), top_k)
 
@@ -348,12 +355,9 @@ class NgramDictionary:
                     "Progress: %d texts | %.0f texts/sec | %d unique n-grams in memory",
                     processed, rate, mem_est,
                 )
-                # Also print for non-logging environments
-                print(
-                    f"  [{processed:,} texts] {rate:,.0f} texts/sec | "
-                    f"{mem_est:,} n-grams in memory | "
-                    f"{elapsed:.0f}s elapsed",
-                    flush=True,
+                logger.info(
+                    "  [%d texts] %.0f texts/sec | %d n-grams | %.0fs elapsed",
+                    processed, rate, mem_est, elapsed,
                 )
 
             # Periodic pruning to control memory
@@ -382,14 +386,9 @@ class NgramDictionary:
 
         elapsed = time.time() - t0
         size = os.path.getsize(output_path)
-        print(
-            f"\nDictionary built: {output_path}\n"
-            f"  Texts processed: {processed:,}\n"
-            f"  Time: {elapsed:.0f}s ({processed/elapsed:,.0f} texts/sec)\n"
-            f"  File size: {size:,} bytes ({size/1024/1024:.1f} MB)\n"
-            f"  N-gram orders: {orders}\n"
-            f"  Top-k per order: {top_k:,}",
-            flush=True,
+        logger.info(
+            "Dictionary built: %s | texts=%d | %.0fs | %.1f MB | orders=%s | top_k=%d",
+            output_path, processed, elapsed, size / 1024 / 1024, orders, top_k,
         )
 
     @staticmethod
@@ -411,8 +410,7 @@ def _token_entropy(tokens: List[str]) -> float:
     entropy = 0.0
     for count in freq.values():
         p = count / total
-        if p > 0:
-            entropy -= p * math.log2(p)
+        entropy -= p * math.log2(p)
     return entropy
 
 
@@ -726,6 +724,11 @@ class PerplexityProfiler:
         if enable_tier2:
             self._gpt2 = _GPT2Engine.get()
 
+    @property
+    def tier(self) -> str:
+        """Return 'tier2' if GPT-2 is loaded and active, else 'tier1'."""
+        return "tier2" if (self._gpt2 is not None and self._gpt2._available) else "tier1"
+
     @staticmethod
     def feature_names() -> tuple:
         """Return ordered tuple of feature names matching vectorize() output."""
@@ -752,7 +755,7 @@ class PerplexityProfiler:
 
         return vec
 
-    def compute_stats(self, text: str) -> Dict[str, float]:
+    def compute_stats(self, text: str) -> Dict[str, Any]:
         """
         Full perplexity analysis returning a feature dictionary.
 
@@ -772,11 +775,10 @@ class PerplexityProfiler:
         result["window_ppls"] = []
         result["tokens_analysed"] = 0
 
-        if not text or len(text.split()) < self._min_tokens:
+        # Tokenize once — reused for guard, features, and entropy windows
+        tokens = re.findall(r"\b\w+\b", text.lower()) if text else []
+        if len(tokens) < self._min_tokens:
             return result
-
-        # ── Tokenize and segment ──────────────────────────────────────
-        tokens = re.findall(r"\b\w+\b", text.lower())
         sentences = _split_sentences(text)
         windows = _segment_into_windows(sentences)
 
@@ -816,7 +818,7 @@ class PerplexityProfiler:
         ppl_arr = np.array(window_ppls, dtype=np.float64)
 
         result["proxy_perplexity_mean"] = float(np.mean(ppl_arr))
-        result["proxy_perplexity_std"] = float(np.std(ppl_arr)) if len(ppl_arr) > 1 else 0.0
+        result["proxy_perplexity_std"] = float(np.std(ppl_arr, ddof=1)) if len(ppl_arr) > 1 else 0.0
         result["perplexity_range"] = float(np.ptp(ppl_arr)) if len(ppl_arr) > 1 else 0.0
 
         # Slope of PPL across windows (positive = getting more human-like)
@@ -845,15 +847,20 @@ class PerplexityProfiler:
         else:
             result["burstiness_perplexity"] = 0.0
 
-        # Hybrid segment ratio
-        result["hybrid_segment_ratio"] = result["low_perplexity_ratio"]
+        # Hybrid segment ratio: fraction of windows in the ambiguous zone
+        # (between strict-AI threshold and human-typical threshold).
+        # Distinct from low_perplexity_ratio (which counts strong-AI windows).
+        ai_strict = _T2_AI_PPL_THRESHOLD_LOW if use_tier2 else _AI_PPL_THRESHOLD_LOW
+        human_typical = _T2_HUMAN_PPL_TYPICAL if use_tier2 else _HUMAN_PPL_TYPICAL
+        hybrid_count = sum(1 for p in window_ppls if ai_strict <= p < human_typical)
+        result["hybrid_segment_ratio"] = hybrid_count / len(window_ppls)
 
         # ── Token entropy features ────────────────────────────────────
         entropy_windows = _windowed_token_entropy(tokens, window_size=50)
         if entropy_windows:
             ent_arr = np.array(entropy_windows, dtype=np.float64)
             result["token_entropy_mean"] = float(np.mean(ent_arr))
-            result["token_entropy_std"] = float(np.std(ent_arr)) if len(ent_arr) > 1 else 0.0
+            result["token_entropy_std"] = float(np.std(ent_arr, ddof=1)) if len(ent_arr) > 1 else 0.0
 
         # ── Tier 2: GPT-2 conditional curvature ──────────────────────
         if use_tier2:
@@ -995,8 +1002,8 @@ class PerplexityRiskClassifier:
 
         votes = []
         for feat, level in severity.items():
-            # Skip curvature if Tier 2 not active (would always vote LOW)
-            if feat == "curvature_score" and stats.get("curvature_score", 0.0) == 0.0:
+            # Skip curvature if Tier 2 not active (Tier 1 always produces 0.0)
+            if feat == "curvature_score" and stats.get("tier", "tier1") == "tier1":
                 continue
             if level == "high":
                 votes.append(1.0)
@@ -1088,36 +1095,24 @@ class PerplexityRiskClassifier:
         return details
 
     def _feat_level(self, feat: str, val: float, tier: str = "tier1") -> str:
-        """
-        Determine HIGH/MEDIUM/LOW for a single feature.
-
-        [FIX v1.2] Tier-aware: uses GPT-2 scale thresholds (10-200+)
-        for Tier 2, and proxy scale thresholds (1-15) for Tier 1.
-        """
-        # Inverse features: lower value = higher AI risk
-        if feat in ("proxy_perplexity_mean", "token_entropy_mean",
-                     "burstiness_perplexity"):
-            if feat == "proxy_perplexity_mean":
-                if tier == "tier2":
-                    # GPT-2 real perplexity: AI ≈ 10-25, Human ≈ 45-200+
-                    if val < _T2_AI_PPL_THRESHOLD_LOW: return "high"
-                    if val < _T2_AI_PPL_THRESHOLD_MED: return "medium"
-                    return "low"
-                else:
-                    # Tier 1 proxy scale: [1, 15]
-                    if val < _AI_PPL_THRESHOLD_LOW: return "high"
-                    if val < _AI_PPL_THRESHOLD_MED: return "medium"
-                    return "low"
-            elif feat == "token_entropy_mean":
-                if val < 3.0: return "high"
-                if val < 4.5: return "medium"
+        """Determine HIGH/MEDIUM/LOW for a single feature. Tier-aware for PPL scale."""
+        if feat == "proxy_perplexity_mean":
+            if tier == "tier2":
+                if val < _T2_AI_PPL_THRESHOLD_LOW: return "high"
+                if val < _T2_AI_PPL_THRESHOLD_MED: return "medium"
                 return "low"
-            else:  # burstiness
-                if val < 0.05: return "high"
-                if val < 0.15: return "medium"
+            else:
+                if val < _AI_PPL_THRESHOLD_LOW: return "high"
+                if val < _AI_PPL_THRESHOLD_MED: return "medium"
                 return "low"
-
-        # Direct features: higher value = higher AI risk
+        if feat == "token_entropy_mean":
+            if val < 3.0: return "high"
+            if val < 4.5: return "medium"
+            return "low"
+        if feat == "burstiness_perplexity":
+            if val < 0.05: return "high"
+            if val < 0.15: return "medium"
+            return "low"
         if feat == "low_perplexity_ratio":
             if val > 0.7: return "high"
             if val > 0.3: return "medium"
@@ -1130,5 +1125,4 @@ class PerplexityRiskClassifier:
             if val > _CURVATURE_HIGH: return "high"
             if val > _CURVATURE_AI_THRESHOLD: return "medium"
             return "low"
-
         return "low"

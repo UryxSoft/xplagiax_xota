@@ -18,8 +18,7 @@ _classifier = None
 _available = False
 
 try:
-    import app.engine  # noqa
-    from perplexity_profiler import PerplexityProfiler, PerplexityRiskClassifier
+    from app.engine.perplexity_profiler import PerplexityProfiler, PerplexityRiskClassifier
     _profiler = PerplexityProfiler(
         ngram_dict_path=os.getenv("PERPLEXITY_DICT_PATH"),
         enable_tier2=os.getenv("PERPLEXITY_TIER2", "1") == "1",
@@ -27,9 +26,7 @@ try:
     _classifier = PerplexityRiskClassifier()
     _available = True
 
-    tier = "tier2" if (_profiler._gpt2 is not None
-                       and _profiler._gpt2._available) else "tier1"
-    logger.info("PerplexityProfiler loaded (%s)", tier)
+    logger.info("PerplexityProfiler loaded (%s)", _profiler.tier)
 except Exception as exc:
     logger.warning("PerplexityProfiler not available: %s", exc)
 
@@ -50,15 +47,11 @@ class PerplexityCheckPlugin(BasePlugin):
             return {"error": "PerplexityProfiler not loaded."}
 
         stats = _profiler.compute_stats(text)
-
-        if _classifier:
-            analysis = _classifier.classify(stats)
-            analysis["window_ppls"] = stats.get("window_ppls", [])
-            analysis["tokens_analysed"] = stats.get("tokens_analysed", 0)
-            analysis["feature_values"] = {
-                k: stats[k] for k in stats
-                if isinstance(stats[k], (int, float))
-            }
-            return analysis
-
-        return stats
+        analysis = _classifier.classify(stats)
+        analysis["window_ppls"] = stats.get("window_ppls", [])
+        analysis["tokens_analysed"] = stats.get("tokens_analysed", 0)
+        analysis["feature_values"] = {
+            k: v for k, v in stats.items()
+            if isinstance(v, (int, float))
+        }
+        return analysis

@@ -46,8 +46,7 @@ _PluginConfig = None
 _available = False
 
 try:
-    import app.engine  # noqa — triggers sys.path setup
-    from plugin_orchestrator import PluginOrchestrator, PluginConfig
+    from app.engine.plugin_orchestrator import PluginOrchestrator, PluginConfig
 
     _PluginConfig = PluginConfig
     _orchestrator = PluginOrchestrator(PluginConfig(

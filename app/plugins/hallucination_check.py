@@ -17,8 +17,7 @@ _classifier = None
 _available = False
 
 try:
-    import app.engine  # noqa
-    from hallucination_profile import HallucinationProfiler, HallucinationRiskClassifier
+    from app.engine.hallucination_profile import HallucinationProfiler, HallucinationRiskClassifier
     _profiler = HallucinationProfiler()
     _classifier = HallucinationRiskClassifier()
     _available = True

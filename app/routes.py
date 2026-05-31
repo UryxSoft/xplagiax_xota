@@ -14,11 +14,40 @@ from __future__ import annotations
 import time
 import logging
 import functools
+from typing import Any, Dict
 from flask import Blueprint, current_app, jsonify, request
 
 logger = logging.getLogger(__name__)
 
 api_bp = Blueprint("api", __name__)
+
+_MAX_TEXT_CHARS = 500_000  # ~125 K words; prevents OOM on oversized payloads
+
+
+def _merge_segment_results(results: Dict[str, Any], doc_result: Dict[str, Any]) -> None:
+    """Enrich the ai_detection entry in *results* with per-segment data from *doc_result*.
+
+    Mutates *results* in-place. Shared by the sync endpoint and the Celery task
+    to avoid divergence from copy-pasted logic.
+    """
+    if "ai_detection" not in results or not doc_result:
+        return
+    ai_result = results["ai_detection"]
+    if ai_result.get("status") != "ok" or not isinstance(ai_result.get("data"), dict):
+        return
+
+    ai_result["data"]["segments"] = doc_result.get("segments", [])
+    summary = doc_result.get("overall_summary", {})
+    ai_result["data"]["overall_summary"] = summary
+    if summary:
+        ai_result["data"]["human_percentage"] = summary.get("total_human_percentage", 50)
+        ai_result["data"]["ai_percentage"] = summary.get("total_ai_percentage", 50)
+        ai_result["data"]["confidence"] = max(
+            summary.get("total_human_percentage", 50),
+            summary.get("total_ai_percentage", 50),
+        )
+        ai_result["data"]["prediction"] = summary.get("overall_prediction", "Unknown")
+        ai_result["data"]["detected_model"] = summary.get("detected_model")
 
 
 def require_api_key(f):
@@ -75,6 +104,9 @@ def analyze():
     if not text or not isinstance(text, str):
         return jsonify({"error": "'text' field is required and must be a non-empty string"}), 400
 
+    if len(text) > _MAX_TEXT_CHARS:
+        return jsonify({"error": f"Text too large. Maximum {_MAX_TEXT_CHARS} characters."}), 413
+
     if not plugins_requested or not isinstance(plugins_requested, list):
         return jsonify({"error": "'plugins' field is required and must be a non-empty list"}), 400
 
@@ -88,15 +120,16 @@ def analyze():
     results = registry.run(plugins_requested, text, timeout=timeout)
 
     elapsed = time.perf_counter() - t0
+    word_count = len(text.split())
 
     logger.info(
         "Analyzed %d words with %d plugins in %.1fms",
-        len(text.split()), len(plugins_requested), elapsed * 1000,
+        word_count, len(plugins_requested), elapsed * 1000,
     )
 
     return jsonify({
         "status": "ok",
-        "word_count": len(text.split()),
+        "word_count": word_count,
         "plugins_requested": plugins_requested,
         "results": results,
         "total_elapsed_ms": round(elapsed * 1000, 1),
@@ -162,6 +195,9 @@ def analyze_document():
     if not text or not isinstance(text, str):
         return jsonify({"error": "'text' field is required and must be a non-empty string"}), 400
 
+    if len(text) > _MAX_TEXT_CHARS:
+        return jsonify({"error": f"Text too large. Maximum {_MAX_TEXT_CHARS} characters."}), 413
+
     # Optional plugins list — mirrors /analyze; defaults to ai_detection
     plugins_requested = payload.get("plugins", ["ai_detection"])
     if not isinstance(plugins_requested, list) or not plugins_requested:
@@ -178,8 +214,7 @@ def analyze_document():
     max_tokens = int(payload.get("max_tokens", 150))
     doc_result = {}
     try:
-        import app.engine  # noqa — ensures sys.path is set
-        from detector_final import analyze_long_document
+        from app.engine.detector_final import analyze_long_document
         doc_result = analyze_long_document(text, max_tokens=max_tokens)
     except Exception as exc:
         logger.warning("analyze_long_document failed: %s", exc)
@@ -187,29 +222,18 @@ def analyze_document():
     segments = doc_result.get("segments", [])
 
     # ── 3. Enrich ai_detection result with segments + overall summary ──
-    if "ai_detection" in results and doc_result:
-        ai_result = results["ai_detection"]
-        if ai_result.get("status") == "ok" and isinstance(ai_result.get("data"), dict):
-            ai_result["data"]["segments"] = segments
-            
-            summary = doc_result.get("overall_summary", {})
-            ai_result["data"]["overall_summary"] = summary
-            
-            if summary:
-                ai_result["data"]["human_percentage"] = summary.get("total_human_percentage", 50)
-                ai_result["data"]["ai_percentage"] = summary.get("total_ai_percentage", 50)
-                ai_result["data"]["confidence"] = max(summary.get("total_human_percentage", 50), summary.get("total_ai_percentage", 50))
-                ai_result["data"]["prediction"] = summary.get("overall_prediction", "Unknown")
+    _merge_segment_results(results, doc_result)
 
     elapsed = time.perf_counter() - t0
+    word_count = len(text.split())
     logger.info(
         "Document analyzed: %d words, plugins=%s, %d segments in %.1fms",
-        len(text.split()), plugins_requested, len(segments), elapsed * 1000,
+        word_count, plugins_requested, len(segments), elapsed * 1000,
     )
 
     return jsonify({
         "status": "ok",
-        "word_count": len(text.split()),
+        "word_count": word_count,
         "plugins_requested": plugins_requested,
         "results": results,
         "total_elapsed_ms": round(elapsed * 1000, 1),

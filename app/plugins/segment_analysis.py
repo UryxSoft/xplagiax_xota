@@ -16,9 +16,8 @@ _analyzer = None
 _available = False
 
 try:
-    import app.engine  # noqa
-    from hybrid_segment_detector import HybridSegmentAnalyzer
-    from detector_final import classify_segment
+    from app.engine.hybrid_segment_detector import HybridSegmentAnalyzer
+    from app.engine.detector_final import classify_segment
     _analyzer = HybridSegmentAnalyzer(classify_fn=classify_segment)
     _available = True
     logger.info("HybridSegmentAnalyzer loaded")

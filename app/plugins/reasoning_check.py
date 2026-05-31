@@ -17,9 +17,8 @@ _classifier = None
 _available = False
 
 try:
-    import app.engine  # noqa
-    from reasoning_profiler import ReasoningProfiler
-    from forensic_reports import ReasoningRiskClassifier
+    from app.engine.reasoning_profiler import ReasoningProfiler
+    from app.engine.forensic_reports import ReasoningRiskClassifier
     _profiler = ReasoningProfiler()
     _classifier = ReasoningRiskClassifier()
     _available = True

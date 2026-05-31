@@ -16,8 +16,7 @@ _analyze_text = None
 _available = False
 
 try:
-    import app.engine  # noqa
-    from detector_final import analyze_fast
+    from app.engine.detector_final import analyze_fast
     _analyze_text = analyze_fast
     _available = True
     logger.info("ModernBERT ensemble loaded for AI detection (analyze_fast)")
@@ -53,7 +52,7 @@ class AIDetectionPlugin(BasePlugin):
             "confidence": max(human_pct, ai_pct),
             "human_percentage": human_pct,
             "ai_percentage": ai_pct,
-            "detected_model": None,  # No extraemos el modelo específico en este modo rápido
+            "detected_model": summary.get("detected_model"),
             "uncertainty_zone": False,
             "raw_scores": {
                 "human": human_pct,

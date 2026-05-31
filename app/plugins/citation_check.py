@@ -20,8 +20,7 @@ _classifier = None
 _available = False
 
 try:
-    import app.engine  # noqa
-    from reference_validator import ReferenceValidator, ReferenceRiskClassifier
+    from app.engine.reference_validator import ReferenceValidator, ReferenceRiskClassifier
     _validator = ReferenceValidator(
         enable_network=os.getenv("REFERENCE_NETWORK", "1") == "1",
     )
@@ -49,14 +48,11 @@ class CitationCheckPlugin(BasePlugin):
             return {"error": "ReferenceValidator not loaded."}
 
         stats = _validator.compute_stats(text)
-
-        if _classifier:
-            analysis = _classifier.classify(stats)
-            analysis["references"] = analysis.get("validation_results", [])
-            analysis["feature_values"] = {
-                k: stats[k] for k in stats
-                if isinstance(stats[k], (int, float))
-            }
-            return analysis
-
-        return stats
+        analysis = _classifier.classify(stats)
+        # "references" kept as backward-compat alias; points to same list object
+        analysis["references"] = analysis["validation_results"]
+        analysis["feature_values"] = {
+            k: v for k, v in stats.items()
+            if isinstance(v, (int, float))
+        }
+        return analysis

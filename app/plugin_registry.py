@@ -58,26 +58,40 @@ class PluginRegistry:
     def run(self, plugin_names: List[str], text: str,
             timeout: int = 30) -> Dict[str, Any]:
         """
-        Execute requested plugins and return aggregated results.
+        Execute requested plugins in parallel and return aggregated results.
 
         Returns dict: {plugin_name: {result or error}}
         """
         results: Dict[str, Any] = {}
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            for pname in plugin_names:
-                plugin = self.get(pname)
-                if plugin is None:
-                    results[pname] = {
-                        "error": f"Plugin '{pname}' not found",
-                        "available": self.list_plugins(),
-                    }
-                    continue
+        valid: List[tuple] = []  # (pname, plugin, t0)
+        for pname in plugin_names:
+            plugin = self.get(pname)
+            if plugin is None:
+                results[pname] = {
+                    "error": f"Plugin '{pname}' not found",
+                    "available": self.list_plugins(),
+                }
+            else:
+                valid.append((pname, plugin))
 
+        if not valid:
+            return results
+
+        max_workers = min(len(valid), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all plugins at once so they run in parallel
+            future_to_meta: Dict[Any, tuple] = {}
+            for pname, plugin in valid:
                 t0 = time.perf_counter()
-                future = executor.submit(plugin.analyze, text)
+                future_to_meta[executor.submit(plugin.analyze, text)] = (pname, t0)
+
+            # Collect with a shared deadline so every plugin gets the full budget
+            deadline = time.perf_counter() + timeout
+            for future, (pname, t0) in future_to_meta.items():
+                remaining = max(0.0, deadline - time.perf_counter())
                 try:
-                    result = future.result(timeout=timeout)
+                    result = future.result(timeout=remaining)
                     elapsed = time.perf_counter() - t0
                     results[pname] = {
                         "status": "ok",

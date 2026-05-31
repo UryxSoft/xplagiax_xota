@@ -49,6 +49,11 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+_ENTRY_ACCENT_MAP: dict = {
+    'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ñ': 'n',
+    'Á': 'a', 'É': 'e', 'Í': 'i', 'Ó': 'o', 'Ú': 'u', 'Ñ': 'n',
+}
+
 # ============================================================================
 # VECTOR SCHEMA
 # ============================================================================
@@ -105,6 +110,7 @@ _PENALTY_FALSE_AUTHOR     = -15
 _BONUS_CROSS_VALIDATED    = +10
 
 _CURRENT_YEAR = datetime.now().year
+_MAX_REFS_TO_VALIDATE = 20
 
 # User-Agent for API requests (polite crawling)
 _USER_AGENT = "XplagiaX-ReferenceValidator/1.0 (mailto:research@xplagiax.com)"
@@ -468,14 +474,18 @@ class ReferenceExtractor:
                 if not year_str or year_str in cite:
                     return True
 
-        # Check body text for author name near year
+        # Check body text: find author then verify year within 80 chars
         if primary_author:
-            pattern = re.compile(
-                rf'\b{re.escape(primary_author)}\b.*?\b{re.escape(year_str)}\b',
-                re.IGNORECASE | re.DOTALL,
-            )
-            if pattern.search(body_text[:5000]):  # only check first 5000 chars
-                return True
+            body_slice = body_text[:5000].lower()
+            author_lower = primary_author.lower()
+            idx = 0
+            while True:
+                pos = body_slice.find(author_lower, idx)
+                if pos == -1:
+                    break
+                if not year_str or year_str in body_text[pos: pos + 80]:
+                    return True
+                idx = pos + 1
 
         return False
 
@@ -647,17 +657,18 @@ def _s2_to_meta(item: dict) -> dict:
 # CONFIDENCE SCORER (CheckIfExist algorithm)
 # ============================================================================
 
-def _compute_confidence(ref: ParsedReference, candidate: dict) -> Tuple[float, List[str]]:
+def _compute_confidence(ref: ParsedReference, candidate: dict) -> Tuple[float, List[str], bool]:
     """
     Compute confidence score [0-100] for a reference-candidate match.
 
     Implements CheckIfExist scoring with Levenshtein similarity
     and penalty system.
 
-    Returns (score, issues_list).
+    Returns (score, issues_list, is_chimeric).
     """
     issues = []
     score = 0.0
+    _is_chimeric = False
 
     # ── Title similarity ──────────────────────────────────────────
     ref_title = _normalize_text(ref.title)
@@ -678,7 +689,8 @@ def _compute_confidence(ref: ParsedReference, candidate: dict) -> Tuple[float, L
         author_sim = len(matched) / max(len(ref_authors), 1)
         score += author_sim * 30  # authors worth 30 points
 
-        if author_sim < _AUTHOR_MISMATCH_THR and title_sim > _TITLE_MATCH_HIGH:
+        _is_chimeric = author_sim < _AUTHOR_MISMATCH_THR and title_sim > _TITLE_MATCH_HIGH
+        if _is_chimeric:
             issues.append(f"Possible chimeric reference: title matches but authors differ")
             score += _PENALTY_AUTHOR_MISMATCH
 
@@ -714,7 +726,7 @@ def _compute_confidence(ref: ParsedReference, candidate: dict) -> Tuple[float, L
             issues.append(f"Journal mismatch (similarity: {journal_sim:.0%})")
             score += _PENALTY_JOURNAL_MISMATCH
 
-    return max(0.0, min(100.0, score)), issues
+    return max(0.0, min(100.0, score)), issues, _is_chimeric
 
 
 # ============================================================================
@@ -804,8 +816,14 @@ class ReferenceValidator:
             return result
 
         # ── Step 2: Validate each reference ───────────────────────
+        refs_to_validate = refs[:_MAX_REFS_TO_VALIDATE]
+        if len(refs) > _MAX_REFS_TO_VALIDATE:
+            logger.warning(
+                "Capping validation to %d / %d refs to prevent worker timeout.",
+                _MAX_REFS_TO_VALIDATE, len(refs),
+            )
         validations: List[ValidationResult] = []
-        for ref in refs:
+        for ref in refs_to_validate:
             if self._enable_network:
                 vr = self._validate_reference(ref)
             else:
@@ -881,7 +899,7 @@ class ReferenceValidator:
             doi_result = self._api.lookup_doi(ref.doi)
             if doi_result:
                 meta = _crossref_to_meta(doi_result)
-                score, issues = _compute_confidence(ref, meta)
+                score, issues, _ = _compute_confidence(ref, meta)
                 vr.confidence_score = score
                 vr.issues.extend(issues)
                 vr.matched_title = meta["title"]
@@ -912,14 +930,18 @@ class ReferenceValidator:
         best_score = 0.0
         best_meta = None
         best_issues = []
+        best_is_chimeric = False
+        all_api_authors: set = set()
 
         for item in cr_results:
             meta = _crossref_to_meta(item)
-            score, issues = _compute_confidence(ref, meta)
+            score, issues, is_chimeric = _compute_confidence(ref, meta)
+            all_api_authors.update(meta["authors"])
             if score > best_score:
                 best_score = score
                 best_meta = meta
                 best_issues = issues
+                best_is_chimeric = is_chimeric
 
         if best_meta and best_score >= _VERIFIED_THRESHOLD:
             vr.confidence_score = best_score
@@ -934,34 +956,38 @@ class ReferenceValidator:
             return vr
 
         # ── Fallback: Semantic Scholar + OpenAlex ─────────────────
+        s2_results: List[dict] = []
+        oa_results: List[dict] = []
         if best_score < _FALLBACK_THRESHOLD:
             # Semantic Scholar
             s2_results = self._api.search_semantic_scholar(query)
             vr.sources_checked.append("semantic_scholar")
             for item in s2_results:
                 meta = _s2_to_meta(item)
-                score, issues = _compute_confidence(ref, meta)
+                score, issues, is_chimeric = _compute_confidence(ref, meta)
+                all_api_authors.update(meta["authors"])
                 if score > best_score:
                     best_score = score
                     best_meta = meta
                     best_issues = issues
+                    best_is_chimeric = is_chimeric
 
             # OpenAlex
             oa_results = self._api.search_openalex(query)
             vr.sources_checked.append("openalex")
             for item in oa_results:
                 meta = _openalex_to_meta(item)
-                score, issues = _compute_confidence(ref, meta)
+                score, issues, is_chimeric = _compute_confidence(ref, meta)
+                all_api_authors.update(meta["authors"])
                 if score > best_score:
                     best_score = score
                     best_meta = meta
                     best_issues = issues
+                    best_is_chimeric = is_chimeric
 
         # ── Cross-validate authors (chimera detection) ────────────
         if best_meta and best_score >= _EXISTS_THRESHOLD:
-            self._cross_validate_authors(ref, vr, best_meta, cr_results,
-                                          s2_results if 'semantic_scholar' in vr.sources_checked else [],
-                                          oa_results if 'openalex' in vr.sources_checked else [])
+            self._cross_validate_authors(ref, vr, all_api_authors)
 
         # ── Final classification ──────────────────────────────────
         if best_meta:
@@ -980,23 +1006,9 @@ class ReferenceValidator:
         else:
             vr.status = "not_found"
 
-        # Check for chimeric pattern
-        if best_meta:
-            ref_title_n = _normalize_text(ref.title)
-            cand_title_n = _normalize_text(best_meta.get("title", ""))
-            title_sim = _similarity_ratio(ref_title_n, cand_title_n)
-            ref_authors = set(ref.authors)
-            cand_authors = set(best_meta.get("authors", []))
-            if ref_authors and cand_authors:
-                author_sim = len(ref_authors & cand_authors) / max(len(ref_authors), 1)
-                if title_sim > _TITLE_MATCH_HIGH and author_sim < _AUTHOR_MISMATCH_THR:
-                    vr.is_chimeric = True
-                    vr.status = "chimeric"
-                    vr.issues.append(
-                        "CHIMERIC: Title matches an existing work but authors "
-                        "do not correspond — elements from multiple papers may "
-                        "have been combined."
-                    )
+        if best_is_chimeric:
+            vr.is_chimeric = True
+            vr.status = "chimeric"
 
         self._check_ornamental(ref, vr)
         return vr
@@ -1043,41 +1055,22 @@ class ReferenceValidator:
 
     def _cross_validate_authors(self, ref: ParsedReference,
                                  vr: ValidationResult,
-                                 best_meta: dict,
-                                 cr_items: list,
-                                 s2_items: list,
-                                 oa_items: list) -> None:
+                                 all_api_authors: set) -> None:
         """
-        Cross-validate authors across multiple databases.
-        Authors confirmed in 2+ sources → confirmed.
-        Authors in query but not in any source → suspicious.
+        Cross-validate authors against the pre-built set of all API-returned
+        author surnames. Avoids re-normalizing raw API items already processed
+        during scoring.
         """
-        all_authors_from_apis: set = set()
-
-        # Collect all authors from all API results
-        for item in cr_items:
-            meta = _crossref_to_meta(item)
-            all_authors_from_apis.update(meta["authors"])
-        for item in s2_items:
-            meta = _s2_to_meta(item)
-            all_authors_from_apis.update(meta["authors"])
-        for item in oa_items:
-            meta = _openalex_to_meta(item)
-            all_authors_from_apis.update(meta["authors"])
-
-        # Cross-validate
         for author in ref.authors:
-            if author in all_authors_from_apis:
+            if author in all_api_authors:
                 vr.confirmed_authors.append(author)
             else:
                 vr.suspicious_authors.append(author)
 
-        # Apply bonus/penalty
         if vr.confirmed_authors:
             vr.confidence_score = min(100, vr.confidence_score + _BONUS_CROSS_VALIDATED)
-        if vr.suspicious_authors:
-            for sa in vr.suspicious_authors:
-                vr.issues.append(f"Author '{sa}' not confirmed in any database")
+        for sa in vr.suspicious_authors:
+            vr.issues.append(f"Author '{sa}' not confirmed in any database")
 
     @staticmethod
     def _build_query(ref: ParsedReference) -> str:

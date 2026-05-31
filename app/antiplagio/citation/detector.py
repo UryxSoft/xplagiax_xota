@@ -11,6 +11,7 @@ Architecture:
   4. Cross-link inline citations → bibliography entries
 """
 
+import bisect
 import re
 import logging
 from collections import Counter, defaultdict
@@ -19,6 +20,11 @@ from enum import Enum
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_ACCENT_MAP: dict = {
+    'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ñ': 'n', 'ü': 'u',
+    'Á': 'a', 'É': 'e', 'Í': 'i', 'Ó': 'o', 'Ú': 'u', 'Ñ': 'n', 'Ü': 'u',
+}
 
 
 # ─────────────────────────────────────────────
@@ -393,18 +399,22 @@ class CitationDetector:
                     confidence=0.90
                 ))
 
-        # MLA (skip if overlapping with APA)
+        # MLA (skip if overlapping with APA) — O(1) span-set lookup
+        _occupied: set = {(c.start_pos, c.end_pos) for c in citations}
         for m in self.patterns.MLA_INLINE.finditer(text):
-            if not any(c.start_pos <= m.start() + offset <= c.end_pos for c in citations):
-                citations.append(CitationMarker(
+            m_start = m.start() + offset
+            if not any(s <= m_start < e for s, e in _occupied):
+                c = CitationMarker(
                     raw_text=m.group(0),
-                    start_pos=m.start() + offset,
+                    start_pos=m_start,
                     end_pos=m.end() + offset,
                     style=CitationStyle.MLA,
                     author=m.group(1),
                     page=m.group(2),
                     confidence=0.80
-                ))
+                )
+                citations.append(c)
+                _occupied.add((c.start_pos, c.end_pos))
 
         # IEEE
         for m in self.patterns.IEEE_INLINE.finditer(text):
@@ -548,9 +558,9 @@ class CitationDetector:
         """Generates a normalized key for citation→bibliography matching."""
         if authors and year:
             first_author_lastname = authors[0].split(',')[0].strip().lower()
-            first_author_lastname = re.sub(r'[áéíóúñ]', lambda m: {
-                'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ñ': 'n'
-            }.get(m.group(0), m.group(0)), first_author_lastname)
+            first_author_lastname = ''.join(
+                _ACCENT_MAP.get(c, c) for c in first_author_lastname
+            )
             return f"{first_author_lastname}_{year}"
         return f"ref_{number}"
 
@@ -571,11 +581,11 @@ class CitationDetector:
         if not citations and not bibliography:
             return CitationStyle.UNKNOWN
 
-        style_counts = {}
+        style_counts: defaultdict = defaultdict(float)
         for c in citations:
-            style_counts[c.style] = style_counts.get(c.style, 0) + 1
+            style_counts[c.style] += 1.0
         for b in bibliography:
-            style_counts[b.style] = style_counts.get(b.style, 0) + 0.5
+            style_counts[b.style] += 0.5
 
         if not style_counts:
             return CitationStyle.UNKNOWN
@@ -600,8 +610,13 @@ class CitationDetector:
                 ln = self._normalize_name(entry.authors[0].split(',')[0])
                 _by_lastname[ln].append(entry)
 
+        # Pre-index zones by start_pos for O(log m) lookups
+        _zone_starts = [z.start_pos for z in zones]
+
         def _mark_zone(citation, entry):
-            for zone in zones:
+            idx = bisect.bisect_right(_zone_starts, citation.start_pos) - 1
+            if idx >= 0:
+                zone = zones[idx]
                 if zone.start_pos <= citation.start_pos < zone.end_pos:
                     if entry not in zone.linked_bibliography:
                         zone.linked_bibliography.append(entry)
@@ -648,7 +663,9 @@ class CitationDetector:
 
             # IEEE/Chicago without bibliography → citation alone is sufficient
             if not matched and citation.style in (CitationStyle.IEEE, CitationStyle.CHICAGO):
-                for zone in zones:
+                idx = bisect.bisect_right(_zone_starts, citation.start_pos) - 1
+                if idx >= 0:
+                    zone = zones[idx]
                     if zone.start_pos <= citation.start_pos < zone.end_pos:
                         zone.has_valid_citation = True
                 matched = True
@@ -659,34 +676,9 @@ class CitationDetector:
         uncited_bibliography = [b for b in bibliography if b.key not in linked_bib_keys]
         return orphan_citations, uncited_bibliography
 
-    def _citation_matches_entry(self, citation: CitationMarker, entry: BibliographyEntry) -> bool:
-        """Determines if an inline citation corresponds to a bibliography entry."""
-        if citation.number is not None and entry.number is not None:
-            return citation.number == entry.number
-
-        if citation.author and entry.authors:
-            cite_lastname = self._normalize_name(
-                citation.author.split(',')[0].split('&')[0].strip()
-            )
-            entry_lastname = self._normalize_name(entry.authors[0].split(',')[0].strip())
-
-            author_match = (
-                cite_lastname == entry_lastname or
-                cite_lastname in entry_lastname or
-                entry_lastname in cite_lastname
-            )
-
-            if author_match:
-                if citation.year and entry.year:
-                    return citation.year == entry.year
-                return True
-
-        return False
-
-    def _normalize_name(self, name: str) -> str:
-        name = name.lower().strip()
-        replacements = {'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ñ': 'n', 'ü': 'u'}
-        return ''.join(replacements.get(c, c) for c in name)
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        return ''.join(_ACCENT_MAP.get(c, c) for c in name.lower().strip())
 
     def _score_zones(self, zones: list) -> None:
         """

@@ -31,21 +31,17 @@ from __future__ import annotations
 import json
 import logging
 import re
-from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from typing import (
     Any,
-    Callable,
     Dict,
     Iterator,
     List,
     Optional,
     Protocol,
-    Sequence,
     Tuple,
-    Union,
 )
 
 import numpy as np
@@ -163,6 +159,66 @@ TRANSITION_WORDS: frozenset = frozenset(
 
 _MULTI_WORD_FILLERS = frozenset(w for w in FILLER_WORDS if " " in w)
 _SINGLE_WORD_FILLERS = FILLER_WORDS - _MULTI_WORD_FILLERS
+
+# Pre-compiled regex for multi-word filler detection (one scan instead of N).
+# Longest alternatives first to prevent partial matches ("sort" matching inside "sort of").
+_MULTI_WORD_FILLER_RE: Optional[re.Pattern] = (
+    re.compile(
+        "|".join(re.escape(e) for e in sorted(_MULTI_WORD_FILLERS, key=len, reverse=True))
+    )
+    if _MULTI_WORD_FILLERS
+    else None
+)
+
+# Unified stop-word set used by _find_signature_words().
+# Merges FUNCTION_WORDS with high-frequency English words not already covered.
+_STOP_WORDS: frozenset = FUNCTION_WORDS | frozenset(
+    {
+        "be", "to", "that", "so", "up", "out", "if", "about",
+        "who", "get", "which", "go", "when", "make",
+        # additional common words excluded from signature detection
+        "not", "his", "say", "my", "one", "all", "there", "their", "what",
+    }
+)
+
+# ── Sentence splitting ────────────────────────────────────────────────────────
+# Guards against false splits on abbreviations (Dr., Mr., etc.) and decimal
+# numbers (3.14, 99.5) that the naive [.!?]+ regex would split incorrectly.
+
+_ABBREV_SENTINEL = "\x02"   # single control char — not present in normal text
+_DECIMAL_SENTINEL = "\x03"
+
+_ABBREV_PATTERN = re.compile(
+    r"\b(Mr|Mrs|Ms|Dr|Prof|St|Jr|Sr|vs|etc|al|Fig|eq|Vol|No|pp)\."
+    r"(?=\s)",
+    re.IGNORECASE,
+)
+_DECIMAL_PATTERN = re.compile(r"(\d)\.(\d)")
+_SENT_SPLIT_RE = re.compile(r"[.!?]+(?=\s|$)")
+
+
+def _split_sentences(text: str) -> List[str]:
+    """
+    Split text into sentences with basic abbreviation and decimal guards.
+
+    Improvements over the naive re.split(r'[.!?]+', text):
+      - Decimal numbers (3.14, 99.5%) are not split mid-number.
+      - Common abbreviations (Dr., Mr., Prof., etc.) are not split.
+      - Only splits when punctuation is followed by whitespace or end-of-string,
+        preventing splits inside URLs and compound words.
+    """
+    protected = _ABBREV_PATTERN.sub(
+        lambda m: m.group().replace(".", _ABBREV_SENTINEL), text
+    )
+    protected = _DECIMAL_PATTERN.sub(
+        lambda m: m.group().replace(".", _DECIMAL_SENTINEL), protected
+    )
+    parts = _SENT_SPLIT_RE.split(protected)
+    return [
+        p.replace(_ABBREV_SENTINEL, ".").replace(_DECIMAL_SENTINEL, ".").strip()
+        for p in parts
+        if p.strip()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -430,14 +486,14 @@ def _extract_punctuation_features(
 
 def _extract_sentence_features(text: str) -> Dict[str, float]:
     """Extract sentence-level length statistics."""
-    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+    sentences = _split_sentences(text)
     if not sentences:
         return {"avg_sentence_length": 0.0, "sentence_length_variance": 0.0}
     lengths = [len(s.split()) for s in sentences]
     return {
         "avg_sentence_length": float(np.mean(lengths)),
         "sentence_length_variance": (
-            float(np.var(lengths)) if len(lengths) > 1 else 0.0
+            float(np.var(lengths, ddof=1)) if len(lengths) > 1 else 0.0
         ),
     }
 
@@ -451,14 +507,14 @@ def _compute_burstiness(text: str) -> float:
     Human writing is characteristically bursty (B > 0).
     LLMs produce more uniform sentence lengths (B near 0 or negative).
     """
-    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+    sentences = _split_sentences(text)
     lengths = np.array([len(s.split()) for s in sentences], dtype=float)
 
     if len(lengths) < 3:
         return 0.0
 
     mu = float(np.mean(lengths))
-    sigma = float(np.std(lengths))
+    sigma = float(np.std(lengths, ddof=1))
 
     if mu + sigma < 1e-9:
         return 0.0
@@ -506,6 +562,12 @@ def _extract_syntactic_features(
     per_sent_avg_depth: List[float] = []
     complex_count = 0
     sent_count = 0
+    _depth_cache: Dict[int, int] = {}
+
+    def _cached_depth(tok: Any) -> int:
+        if tok.i not in _depth_cache:
+            _depth_cache[tok.i] = _token_depth(tok)
+        return _depth_cache[tok.i]
 
     for sent in doc.sents:
         sent_count += 1
@@ -518,7 +580,7 @@ def _extract_syntactic_features(
             per_sent_avg_dist.append(float(np.mean(dists)))
             per_sent_max_dist.append(float(max(dists)))
 
-        depths = [_token_depth(tok) for tok in tokens]
+        depths = [_cached_depth(tok) for tok in tokens]
         per_sent_avg_depth.append(float(np.mean(depths)))
 
         dep_labels = {tok.dep_ for tok in tokens}
@@ -563,13 +625,27 @@ def _mixed_frequencies(text: str, word_set: frozenset) -> Dict[str, float]:
     total = max(len(words), 1)
     counts = Counter(words)
     result: Dict[str, float] = {}
+
+    # One regex scan for all multi-word entries (avoids N separate findall calls)
+    if _MULTI_WORD_FILLER_RE is not None:
+        mc: Counter = Counter()
+        for m in _MULTI_WORD_FILLER_RE.finditer(lower):
+            entry = m.group()
+            if entry in word_set:
+                mc[entry] += 1
+        for entry, n in mc.items():
+            result[entry] = n / total
+    else:
+        for entry in word_set:
+            if " " in entry:
+                n = len(re.findall(re.escape(entry), lower))
+                if n:
+                    result[entry] = n / total
+
     for entry in word_set:
-        if " " in entry:
-            n = len(re.findall(re.escape(entry), lower))
-            if n:
-                result[entry] = n / total
-        elif entry in counts:
+        if " " not in entry and entry in counts:
             result[entry] = counts[entry] / total
+
     return result
 
 
@@ -734,6 +810,24 @@ _STAT_VECTOR_SIZE: int = (
 # ===== CANONICAL EXPORT — use this everywhere, never a magic number =====
 VECTOR_DIM: int = _STAT_VECTOR_SIZE
 
+# Features used for per-feature explainability in compare()
+_EXPLAINABLE: Tuple[str, ...] = (
+    "vocabulary_richness",
+    "avg_word_length",
+    "rare_word_ratio",
+    "hapax_legomena_ratio",
+    "comma_rate",
+    "semicolon_rate",
+    "exclamation_rate",
+    "question_rate",
+    "avg_sentence_length",
+    "sentence_length_variance",
+    "avg_dep_distance",
+    "avg_tree_depth",
+    "complex_sentence_ratio",
+    "burstiness_score",
+)
+
 
 # ---------------------------------------------------------------------------
 # Vector construction
@@ -834,16 +928,16 @@ def _calibrate_threshold(
         )
         return None, stacked.mean(axis=0), stacked.std(axis=0) + 1e-9
 
+    n = len(raw_vectors)
     stacked = np.stack(raw_vectors)
     global_mean = stacked.mean(axis=0)
     global_std = stacked.std(axis=0) + 1e-9
+    total_sum = stacked.sum(axis=0)
     scores: List[float] = []
 
-    for i in range(len(raw_vectors)):
-        others = [raw_vectors[j] for j in range(len(raw_vectors)) if j != i]
-        ref_norm = _normalise_vector(
-            np.mean(np.stack(others), axis=0), global_mean, global_std
-        )
+    for i in range(n):
+        others_mean = (total_sum - raw_vectors[i]) / (n - 1)
+        ref_norm = _normalise_vector(others_mean, global_mean, global_std)
         tst_norm = _normalise_vector(raw_vectors[i], global_mean, global_std)
         nr, nt = np.linalg.norm(ref_norm), np.linalg.norm(tst_norm)
         if nr > 0 and nt > 0:
@@ -885,7 +979,7 @@ def _compute_profile_data(
     syntactic-feature extractors.
     """
     combined = " ".join(texts)
-    sentences = [s.strip() for s in re.split(r"[.!?]+", combined) if s.strip()]
+    sentences = _split_sentences(combined)
     paragraphs = [p.strip() for p in combined.split("\n\n") if p.strip()]
     words = re.findall(r"\b\w+\b", combined.lower())
     total_words = max(len(words), 1)
@@ -912,8 +1006,15 @@ def _compute_profile_data(
     filler_freq = _mixed_frequencies(combined, FILLER_WORDS)
     trans_freq = _word_frequencies(combined, TRANSITION_WORDS)
 
-    bigrams = _build_word_ngrams(words, 2)
-    trigrams = _build_word_ngrams(words, 3)
+    # Single pass for both bigrams and trigrams (avoids two O(n) sweeps)
+    bigrams: Counter = Counter()
+    trigrams: Counter = Counter()
+    _wn = len(words)
+    for _i in range(_wn):
+        if _i + 1 < _wn:
+            bigrams[words[_i] + " " + words[_i + 1]] += 1
+        if _i + 2 < _wn:
+            trigrams[words[_i] + " " + words[_i + 1] + " " + words[_i + 2]] += 1
     char4 = _extract_char_ngrams(combined, n=4, top_k=80)
     char5 = _extract_char_ngrams(combined, n=5, top_k=60)
 
@@ -974,21 +1075,11 @@ def _find_signature_words(
     words: List[str], top_n: int = 20, min_freq: int = 3
 ) -> List[str]:
     """Identify distinctive vocabulary for the author."""
-    common_english = frozenset(
-        {
-            "the", "be", "to", "of", "and", "a", "in", "that", "have", "it",
-            "for", "not", "on", "with", "he", "as", "you", "do", "at", "this",
-            "but", "his", "by", "from", "they", "we", "say", "her", "she",
-            "or", "an", "will", "my", "one", "all", "would", "there", "their",
-            "what", "so", "up", "out", "if", "about", "who", "get", "which",
-            "go", "me", "when", "make",
-        }
-    )
     counts = Counter(words)
     candidates = [
         (w, c)
         for w, c in counts.items()
-        if w not in common_english and c >= min_freq and len(w) > 3
+        if w not in _STOP_WORDS and c >= min_freq and len(w) > 3
     ]
     candidates.sort(key=lambda x: x[1], reverse=True)
     return [w for w, _ in candidates[:top_n]]
@@ -1016,7 +1107,9 @@ def _syntactic_distance(
     cv = np.array(
         [getattr(candidate, f, 0.0) for f in _SYNTACTIC_FEATURES], dtype=float
     )
-    denom = np.abs(pv) + 1e-9
+    # Use max of both to avoid near-zero denominator inflating distance
+    # when spaCy features are missing on one side.
+    denom = np.maximum(np.abs(pv), np.abs(cv)) + 1e-9
     return float(np.mean(np.abs(pv - cv) / denom))
 
 
@@ -1116,9 +1209,12 @@ class StylometricProfiler:
         profile = _compute_profile_data(
             "_stats_", [text], nlp=self._nlp
         )
+        # lexical_diversity = simple TTR (unique/total); vocabulary_richness = MATTR
+        _words = re.findall(r"\b\w+\b", text.lower())
+        simple_ttr = len(set(_words)) / max(len(_words), 1)
         return {
             "burstiness": profile.burstiness_score,
-            "lexical_diversity": profile.vocabulary_richness,
+            "lexical_diversity": simple_ttr,
             "avg_sentence_length": profile.avg_sentence_length,
             "sentence_length_variance": profile.sentence_length_variance,
             "avg_word_length": profile.avg_word_length,
@@ -1259,23 +1355,6 @@ class StylometricProfiler:
             else similarity_threshold
         )
 
-        # Explainability: per-feature distances
-        _EXPLAINABLE = (
-            "vocabulary_richness",
-            "avg_word_length",
-            "rare_word_ratio",
-            "hapax_legomena_ratio",
-            "comma_rate",
-            "semicolon_rate",
-            "exclamation_rate",
-            "question_rate",
-            "avg_sentence_length",
-            "sentence_length_variance",
-            "avg_dep_distance",
-            "avg_tree_depth",
-            "complex_sentence_ratio",
-            "burstiness_score",
-        )
         pv = np.array(
             [getattr(profile, f, 0.0) for f in _EXPLAINABLE], dtype=float
         )
@@ -1284,6 +1363,88 @@ class StylometricProfiler:
         )
         diffs = np.abs(pv - cv) / (np.abs(pv) + 1e-9)
 
+        feature_distances = dict(zip(_EXPLAINABLE, diffs.tolist()))
+        anomalous = [n for n, d in feature_distances.items() if d > 0.30]
+        confidence = min(
+            1.0,
+            similarity
+            + 0.1 * (1.0 - len(anomalous) / max(len(_EXPLAINABLE), 1)),
+        )
+
+        return StyleComparisonResult(
+            author_id=profile.author_id,
+            similarity_score=similarity,
+            is_likely_same_author=similarity >= threshold,
+            confidence=confidence,
+            threshold_used=threshold,
+            scorer_used=scorer_label,
+            feature_distances=feature_distances,
+            anomalous_features=anomalous,
+        )
+
+    def _compare_profiles(
+        self,
+        profile: StyleProfile,
+        candidate: StyleProfile,
+        similarity_threshold: float = 0.80,
+        siamese_scorer: Optional[SiameseScorer] = None,
+    ) -> StyleComparisonResult:
+        """Compare a pre-built candidate profile against an author profile.
+
+        Avoids the extra _compute_profile_data() call that compare() would
+        trigger internally via _build_temp_profile().
+        """
+        c_stat_norm = _normalise_vector(
+            candidate.feature_vector,
+            profile.feature_mean,
+            profile.feature_std,
+        )
+        c_full = _fuse_vectors(c_stat_norm, candidate.embedding_vector)
+
+        p_vec = profile.feature_vector
+        c_vec = c_full
+        min_dim = min(p_vec.size, c_vec.size)
+        p_vec = p_vec[:min_dim]
+        c_vec = c_vec[:min_dim]
+
+        similarity: float = 0.0
+        scorer_label: str = "cosine"
+
+        if siamese_scorer is not None:
+            try:
+                similarity = float(
+                    np.clip(siamese_scorer.score(p_vec, c_vec), 0.0, 1.0)
+                )
+                scorer_label = "siamese"
+            except Exception as exc:
+                logger.warning(
+                    "SiameseScorer.score() failed (%s) — falling back.", exc
+                )
+                siamese_scorer = None
+
+        if siamese_scorer is None:
+            np_p, np_c = np.linalg.norm(p_vec), np.linalg.norm(c_vec)
+            if np_p == 0 or np_c == 0:
+                similarity = 0.0
+            else:
+                similarity = float(
+                    np.clip(1.0 - cosine(p_vec, c_vec), 0.0, 1.0)
+                )
+            scorer_label = "cosine"
+
+        threshold = (
+            profile.adaptive_threshold
+            if profile.adaptive_threshold is not None
+            else similarity_threshold
+        )
+
+        pv = np.array(
+            [getattr(profile, f, 0.0) for f in _EXPLAINABLE], dtype=float
+        )
+        cv = np.array(
+            [getattr(candidate, f, 0.0) for f in _EXPLAINABLE], dtype=float
+        )
+        diffs = np.abs(pv - cv) / (np.abs(pv) + 1e-9)
         feature_distances = dict(zip(_EXPLAINABLE, diffs.tolist()))
         anomalous = [n for n, d in feature_distances.items() if d > 0.30]
         confidence = min(
@@ -1330,8 +1491,11 @@ class StylometricProfiler:
             if not chunk.strip():
                 continue
 
-            # Signal 1: stylometric similarity
-            cmp_result = self.compare(chunk, profile)
+            # Build temp profile once — reused for all three signals
+            w_profile = self._build_temp_profile(chunk, profile)
+
+            # Signal 1: stylometric similarity (reuses w_profile)
+            cmp_result = self._compare_profiles(profile, w_profile)
             curr_sim = cmp_result.similarity_score
             style_drop = (
                 (prev_sim - curr_sim) if prev_sim is not None else 0.0
@@ -1339,11 +1503,10 @@ class StylometricProfiler:
             prev_sim = curr_sim
 
             # Signal 2: burstiness deviation
-            w_burst = _compute_burstiness(chunk)
+            w_burst = w_profile.burstiness_score
             burst_dev = abs(w_burst - profile.burstiness_score)
 
-            # Signal 3: syntactic distance
-            w_profile = self._build_temp_profile(chunk, profile)
+            # Signal 3: syntactic distance (reuses w_profile)
             syn_dist = _syntactic_distance(profile, w_profile)
 
             combined = (

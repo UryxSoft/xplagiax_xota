@@ -19,8 +19,7 @@ _generator_class = None
 _available = False
 
 try:
-    import app.engine  # noqa
-    from forensic_reports import ForensicReportGenerator
+    from app.engine.forensic_reports import ForensicReportGenerator
     _generator_class = ForensicReportGenerator
     _available = True
     logger.info("ForensicReportGenerator loaded (v3.9)")

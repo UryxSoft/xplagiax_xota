@@ -17,9 +17,8 @@ _decoder = None
 _available = False
 
 try:
-    import app.engine  # noqa
     import torch
-    from watermark_decoder import WatermarkDecoder
+    from app.engine.watermark_decoder import WatermarkDecoder
     _decoder = WatermarkDecoder()
     _available = True
     logger.info("WatermarkDecoder loaded")

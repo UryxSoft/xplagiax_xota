@@ -3,27 +3,20 @@
 import torch
 import os
 import warnings
+import logging
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-import sys
+logger = logging.getLogger(__name__)
 import re
-import time
-from typing import List, Tuple, Dict, Optional, Any
+from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass, field
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from tokenizers import normalizers
-from tokenizers.normalizers import Sequence, Replace, Strip, NFKC
+from tokenizers.normalizers import Sequence, Replace, Strip
 from tokenizers import Regex
 try:
     import matplotlib.pyplot as plt
 except ImportError:
     plt = None
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(it, **kwargs):  # type: ignore[misc]
-        return it
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -256,9 +249,12 @@ def classify_segment(text: str) -> Tuple[float, float]:
 
 
 @torch.inference_mode()
-def _classify_batch_from_ids(id_seqs: List[List[int]]) -> List[Tuple[float, float]]:
+def _classify_batch_from_ids(id_seqs: List[List[int]]) -> List[Tuple[float, float, Optional[str]]]:
     """
     Inference directly on pre-tokenized ID sequences — no decode→re-encode round-trip.
+
+    Returns List of (human_pct, ai_pct, detected_model) where detected_model is
+    the highest-probability AI model label (or None when human wins).
 
     id_seqs must NOT contain special tokens; this function adds them via
     tokenizer.build_inputs_with_special_tokens (model-agnostic).
@@ -296,10 +292,17 @@ def _classify_batch_from_ids(id_seqs: List[List[int]]) -> List[Tuple[float, floa
         + torch.softmax(logits_3, dim=1)
     ) / 3
 
-    return [
-        (round(avg_probs[i][24].item() * 100), round((1.0 - avg_probs[i][24].item()) * 100))
-        for i in range(len(id_seqs))
-    ]
+    results = []
+    for i in range(len(id_seqs)):
+        probs = avg_probs[i]
+        human_pct = round(probs[24].item() * 100)
+        ai_pct = 100 - human_pct
+        # Identify the specific AI model with highest probability (excluding human index 24)
+        ai_clone = probs.clone()
+        ai_clone[24] = 0.0
+        detected_model: Optional[str] = label_mapping[int(torch.argmax(ai_clone).item())] if ai_pct > human_pct else None
+        results.append((human_pct, ai_pct, detected_model))
+    return results
 
 
 def validar_veredicto_segmento(segmento_dict: dict) -> dict:
@@ -332,9 +335,17 @@ def validar_veredicto_segmento(segmento_dict: dict) -> dict:
     referencias  = analisis.get("reference_check", {})
 
     # ── 1. CRITERIO DE DESCARTE (Falso Positivo) ──────────────────────────
-    # Si el modelo dice IA, pero no hay indicadores de razonamiento y el texto
-    # tiene una entropía muy alta (humana), es probable que sea un falso positivo.
-    if razonamiento.get("ai_score", 0) < 0.25 and perplejidad.get("ai_score", 0) < 0.40:
+    # Si el modelo dice IA pero no hay indicadores forenses y la confianza base
+    # no es muy alta (<= 80%), es probable que sea un falso positivo.
+    # Guardia: no se descarta cuando el ensemble base tiene >= 85% de confianza.
+    base_score_for_discard = segmento_dict.get("score", 0.0)
+    base_label_for_discard = segmento_dict.get("dominant_label", "")
+    high_confidence_ai = "AI" in base_label_for_discard and base_score_for_discard >= 85.0
+    if (
+        razonamiento.get("ai_score", 0) < 0.25
+        and perplejidad.get("ai_score", 0) < 0.40
+        and not high_confidence_ai
+    ):
         segmento_dict["dominant_label"] = "Human (Validated)"
         segmento_dict["score"] = 100 - segmento_dict["score"]
         segmento_dict["status_note"] = (
@@ -424,8 +435,8 @@ def analyze_long_document(long_text: str, orchestrator=None, max_tokens: int = 5
     total_ai_weighted = 0.0
     total_tokens_processed = 0
     
-    print(f"\nIniciando análisis forense de {len(chunks_text)} segmentos...")
-    
+    logger.debug("Iniciando análisis forense de %d segmentos...", len(chunks_text))
+
     # 2. Procesamiento de Segmentos por Lotes
     BATCH_SIZE = 8
     for i in range(0, len(chunks_text), BATCH_SIZE):
@@ -469,18 +480,20 @@ def analyze_long_document(long_text: str, orchestrator=None, max_tokens: int = 5
             total_tokens_processed += chunk_len
 
     # 5. Resumen Final
+    if total_tokens_processed == 0:
+        return {"error": "No se pudieron procesar tokens del documento."}
     overall_human = round(total_human_weighted / total_tokens_processed)
     overall_ai = round(total_ai_weighted / total_tokens_processed)
-    
+
     results["overall_summary"] = {
         "total_human_percentage": overall_human,
         "total_ai_percentage": overall_ai,
         "overall_prediction": "AI" if overall_ai > overall_human else "Human"
     }
-    
+
     return results
 
-    
+
 def analyze_long_documentsd_(long_text: str, max_tokens: int = 512) -> dict:
     """
     Analiza un documento dividiéndolo de forma inteligente por párrafos u oraciones,
@@ -543,8 +556,8 @@ def analyze_long_documentsd_(long_text: str, max_tokens: int = 512) -> dict:
     total_ai_weighted = 0.0
     total_tokens_processed = 0
     
-    print(f"\nIniciando análisis semántico de {len(chunks_text)} segmentos...")
-    
+    logger.debug("Iniciando análisis semántico de %d segmentos...", len(chunks_text))
+
     # 4. Procesar por lotes
     BATCH_SIZE = 8
     for i in range(0, len(chunks_text), BATCH_SIZE):
@@ -571,21 +584,18 @@ def analyze_long_documentsd_(long_text: str, max_tokens: int = 512) -> dict:
             total_tokens_processed += chunk_length
 
     # 5. Cálculo final
+    if total_tokens_processed == 0:
+        return {"error": "No se pudieron procesar tokens del documento."}
     overall_human = round(total_human_weighted / total_tokens_processed)
     overall_ai = round(total_ai_weighted / total_tokens_processed)
-    
+
     results["overall_summary"] = {
         "total_human_percentage": overall_human,
         "total_ai_percentage": overall_ai,
         "overall_prediction": "AI" if overall_ai > overall_human else "Human"
     }
-    
-    return results
 
-"""
-with iface:
-    text_input.change(_gradio_classify, inputs=text_input, outputs=[result_output, plot_output])
-"""
+    return results
 
 
 @torch.inference_mode()
@@ -642,7 +652,7 @@ def analyze_fast(text: str) -> dict:
     chunk_lengths = [len(ids) for ids in chunk_id_seqs]
 
     # 3. Batch inference directly on token IDs — eliminates decode→re-encode round-trip
-    all_pcts = []
+    all_pcts: List[Tuple[float, float, Optional[str]]] = []
     for i in range(0, len(chunk_id_seqs), BATCH_SIZE):
         all_pcts.extend(_classify_batch_from_ids(chunk_id_seqs[i: i + BATCH_SIZE]))
 
@@ -655,8 +665,9 @@ def analyze_fast(text: str) -> dict:
     # 5. Weighted summary + per-segment results
     segments = []
     total_human_w = total_ai_w = total_len = 0
+    detected_model_votes: Dict[str, float] = {}  # token-weighted votes per AI model
 
-    for idx, ((human_pct, ai_pct), tok_len) in enumerate(
+    for idx, ((human_pct, ai_pct, det_model), tok_len) in enumerate(
         zip(all_pcts, chunk_lengths)
     ):
         segments.append({
@@ -668,15 +679,22 @@ def analyze_fast(text: str) -> dict:
         total_human_w += human_pct * tok_len
         total_ai_w += ai_pct * tok_len
         total_len += tok_len
+        if det_model is not None:
+            detected_model_votes[det_model] = detected_model_votes.get(det_model, 0.0) + tok_len
+
+    if total_len == 0:
+        return {"error": "No se pudieron procesar tokens del documento."}
 
     overall_human = round(total_human_w / total_len)
     overall_ai = round(total_ai_w / total_len)
+    overall_detected = max(detected_model_votes, key=detected_model_votes.get) if detected_model_votes else None
 
     return {
         "overall_summary": {
             "total_human_percentage": overall_human,
             "total_ai_percentage": overall_ai,
             "overall_prediction": "AI" if overall_ai > overall_human else "Human",
+            "detected_model": overall_detected,
         },
         "segments": segments,
     }

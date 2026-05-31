@@ -6,6 +6,7 @@ import time
 import logging
 from flask import current_app
 from app.celery_app import celery
+from app.routes import _merge_segment_results
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +84,7 @@ def analyze_document_task(self, payload):
             # Fallback: ai_detection was not requested or returned no segments.
             # analyze_fast uses adaptive max_tokens — no argument needed.
             try:
-                import app.engine
-                from detector_final import analyze_fast as _seg_fn
+                from app.engine.detector_final import analyze_fast as _seg_fn
                 doc_result = _seg_fn(text)
             except Exception as exc:
                 logger.warning("analyze_fast failed in task: %s", exc)
@@ -92,21 +92,7 @@ def analyze_document_task(self, payload):
         segments = doc_result.get("segments", [])
 
         # 3. Merge results
-        if "ai_detection" in results and doc_result:
-            ai_result = results["ai_detection"]
-            if ai_result.get("status") == "ok" and isinstance(ai_result.get("data"), dict):
-                ai_result["data"]["segments"] = segments
-
-                summary = doc_result.get("overall_summary", {})
-                ai_result["data"]["overall_summary"] = summary
-
-                # Sincronizamos los porcentajes de la raíz para que el frontend vea
-                # el porcentaje exacto tras la validación forense
-                if summary:
-                    ai_result["data"]["human_percentage"] = summary.get("total_human_percentage", 50)
-                    ai_result["data"]["ai_percentage"] = summary.get("total_ai_percentage", 50)
-                    ai_result["data"]["confidence"] = max(summary.get("total_human_percentage", 50), summary.get("total_ai_percentage", 50))
-                    ai_result["data"]["prediction"] = summary.get("overall_prediction", "Unknown")
+        _merge_segment_results(results, doc_result)
 
         elapsed = time.perf_counter() - t0
 

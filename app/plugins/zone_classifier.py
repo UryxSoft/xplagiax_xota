@@ -46,6 +46,20 @@ class ZoneClassifierPlugin(BasePlugin):
     def analyze(self, text: str) -> Dict[str, Any]:
         if not _available:
             return {"error": "CitationDetector not available."}
+        if not text or len(text.strip()) < 30:
+            return {
+                "dominant_style": "Unknown",
+                "style_consistency": 0.0,
+                "citation_coverage": 100.0,
+                "total_inline_citations": 0,
+                "total_bibliography": 0,
+                "orphan_citations": 0,
+                "uncited_bibliography": 0,
+                "zones": [],
+                "inline_citations": [],
+                "bibliography": [],
+                "issues": {"orphan_citations": [], "uncited_bibliography": []},
+            }
 
         result = _detector.analyze(text)
 
@@ -86,7 +100,7 @@ class ZoneClassifierPlugin(BasePlugin):
                 "doi": e.doi,
                 "url": e.url,
             }
-            for e in result.bibliography
+            for e in result.bibliography[:50]
         ]
 
         return {
