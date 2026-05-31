@@ -1387,8 +1387,34 @@ docker run -d \
   -e CROSSREF_EMAIL="your@institution.edu" \
   xplagiax_xota:latest
 
+
+
+docker run -d \
+  --name xplagiax-xota \
+  --network xplagiax-net \
+  --restart unless-stopped \
+  -p 5006:5006 \
+  -e WEB_CONCURRENCY=2 \
+  -e FLASK_ENV=production \
+  -e SECRET_KEY=your-secret-key \
+  -e API_KEY=your-api-key \
+  -e REDIS_URL="redis://redis:6379" \
+  -e CELERY_BROKER_URL="redis://redis:6379/0" \
+  -e CELERY_RESULT_BACKEND="redis://redis:6379/1" \
+  -e CROSSREF_EMAIL="rgonzalez@uryxtech.com" \
+  xplagiax_xota:latest
+
 # 4. Verify the internal Celery worker is running alongside Gunicorn
 docker exec xplagiax-xota ps aux | grep -E "gunicorn|celery"
+
+
+
+curl -X POST http://localhost:5006/analyze_document_async -H "Content-Type: application/json" -H "X-API-Key: 7d9a2c4f8e1b3d5a6f7c9e2b4a1d8c3f" -d '{"text":" In modern workplaces, EI is often considered as important as technical expertise. Employees with high emotional intelligence tend to work better in teams. They know how to manage conflicts, stay calm under pressure, and build strong professional relationships. This emotional stability contributes to a healthier work atmosphere where productivity naturally increases. Leaders who possess emotional intelligence are especially effective. Instead of managing through fear or authority, they inspire trust and motivation. Their empathy helps them understand their team'\''s needs and align individual goals with organizational objectives","plugins":["ai_detection"]}'
+
+docker run -d   --name xplagiax-xota   --network xplagiax-net   --restart unless-stopped   -p 5006:5006   -e WEB_CONCURRENCY=2   -e FLASK_ENV=production   -e SECRET_KEY="a3f7d9c4e8b1f6a2c5d7e9f1a3b5c7d9e2f4a6b8c1d3e5f7a9b1c3d5e7f9a2b"   -e API_KEY="7d9a2c4f8e1b3d5a6f7c9e2b4a1d8c3f"   -e REDIS_URL="redis://redis:6379"   -e CELERY_BROKER_URL="redis://redis:6379/0"   -e CELERY_RESULT_BACKEND="redis://redis:6379/1"   -e CROSSREF_EMAIL="rgonzalez@uryxtech.com"   xplagiax_xota:latest
+
+
+
 ```
 
 ### Troubleshooting

@@ -26,6 +26,11 @@ services:
       retries: 5
 
   # ── 2. Flask / Gunicorn web server ──────────────────────────────
+  # GUNICORN_SPAWN_CELERY=1 forks the Celery worker from the gunicorn
+  # master AFTER preload_app, so the worker inherits the 1.7 GB of model
+  # weights via Linux CoW — no second copy in RAM.
+  # The separate celery_worker service below is disabled by default
+  # (profiles: ["external-celery"]) to avoid duplicate workers + double RAM.
   web:
     build: .
     image: xplagiax_xota
@@ -34,14 +39,15 @@ services:
     ports:
       - "5006:5006"
     environment:
-      # When REDIS_PASSWORD is set, override REDIS_URL to include the password:
-      # REDIS_URL=redis://:yourpassword@redis:6379
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # Fork Celery from gunicorn master (CoW — no model duplication)
+      GUNICORN_SPAWN_CELERY: "1"
     networks:
       - xplagiax-net
     depends_on:
       redis:
         condition: service_healthy
+    mem_limit: ${WEB_MEM_LIMIT:-4g}
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:5006/health')"]
@@ -50,16 +56,25 @@ services:
       start_period: 120s
       retries: 3
 
-  # ── 3. Celery worker ────────────────────────────────────────────
+  # ── 3. Celery worker (external — disabled by default) ───────────
+  # Only activate this if you explicitly need a separate Celery container
+  # (e.g. for scaling workers independently). When active, disable
+  # GUNICORN_SPAWN_CELERY in the web service to avoid duplicate workers.
+  # WARNING: a separate container does NOT share CoW memory with gunicorn —
+  # the models are loaded a second time, adding ~1.7 GB of RAM.
+  #
+  # To enable: docker compose --profile external-celery up
   celery_worker:
     image: xplagiax_xota
     container_name: xplagiax_xota_worker
+    profiles: ["external-celery"]
     restart: unless-stopped
     command: >
       celery -A app.celery_app.celery worker
       --loglevel=info
       --concurrency=1
       --pool=solo
+      --max-tasks-per-child=50
     environment:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     networks:
@@ -69,6 +84,7 @@ services:
         condition: service_healthy
       web:
         condition: service_started
+    mem_limit: ${CELERY_MEM_LIMIT:-3g}
     healthcheck:
       test: ["CMD-SHELL",
              "celery -A app.celery_app.celery inspect ping -d celery@$$HOSTNAME --timeout 10 || exit 1"]

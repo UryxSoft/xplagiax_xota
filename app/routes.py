@@ -399,7 +399,20 @@ def analyze_stream():
 
 @api_bp.route("/health", methods=["GET"])
 def health():
-    """Always 200 if the process is alive."""
+    """
+    Liveness probe.  503 if Redis is required but unreachable.
+    Redis is checked only when REDIS_URL is set (production mode).
+    """
+    redis_url = current_app.config.get("REDIS_URL", "")
+    if redis_url and not redis_url.startswith("memory://"):
+        try:
+            import redis as _redis
+            _r = _redis.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
+            _r.ping()
+        except Exception as exc:
+            logger.warning("Health check: Redis unreachable — %s", exc)
+            return jsonify({"status": "degraded", "reason": "Redis unreachable"}), 503
+
     return jsonify({"status": "healthy"}), 200
 
 

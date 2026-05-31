@@ -71,6 +71,10 @@ def _run_celery():
         "--without-heartbeat",
         "--without-gossip",
         "--without-mingle",
+        # Recycle the worker process after 50 tasks — equivalent to gunicorn's
+        # max_requests. Prevents Python high-water-mark memory from accumulating
+        # indefinitely over long uptimes. gunicorn will restart it via child_exit.
+        "--max-tasks-per-child=50",
     ]
     celery_main()
 
