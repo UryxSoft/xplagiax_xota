@@ -115,6 +115,25 @@ _MIN_SENTENCES_FOR_WINDOWS = 3     # Don't segment if fewer sentences
 _NGRAM_ORDERS             = (2, 3, 4)   # Bigrams, trigrams, 4-grams
 _SMOOTHING_ALPHA          = 0.01        # Laplace smoothing
 
+# EC-03 / 4.2-Bias-1: high-frequency English function words used to detect
+# non-English text without an external dependency. A text with < 2% of tokens
+# matching these words is almost certainly not English, making n-gram perplexity
+# scores unreliable (dict is calibrated on English corpora).
+_ENGLISH_FUNCTION_WORDS: frozenset = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "must", "in", "on", "at",
+    "of", "to", "for", "with", "by", "from", "as", "that", "this", "these",
+    "those", "and", "or", "but", "not", "it", "its", "they", "their",
+    "he", "she", "we", "you", "i", "my", "your", "our",
+})
+_ENGLISH_FUNCTION_WORD_MIN_RATIO: float = 0.02  # < 2% → likely non-English
+
+# 4.2-Bias-3: minimum token count below which length-confidence is too low
+# to trust the score (compute_stats already guards at _min_tokens, but we
+# flag intermediate cases so consumers can display a warning).
+_SHORT_TEXT_WARNING_TOKENS: int = 100
+
 # Sentence splitting regex (same pattern as reasoning_profiler.py)
 _SENTENCE_RE = re.compile(
     r"(?<=[.!?])\s+(?=[A-Z\d\"'])",
@@ -779,6 +798,17 @@ class PerplexityProfiler:
         tokens = re.findall(r"\b\w+\b", text.lower()) if text else []
         if len(tokens) < self._min_tokens:
             return result
+
+        # EC-03 / 4.2-Bias-1: non-English detection via function-word ratio.
+        fn_ratio = sum(1 for t in tokens if t in _ENGLISH_FUNCTION_WORDS) / len(tokens)
+        if fn_ratio < _ENGLISH_FUNCTION_WORD_MIN_RATIO:
+            result["language_warning"] = "non_english"
+            result["low_confidence"] = True
+
+        # 4.2-Bias-3: short-text warning (not filtered, but consumers should
+        # display reduced confidence for texts near the minimum length).
+        if len(tokens) < _SHORT_TEXT_WARNING_TOKENS:
+            result["short_text_warning"] = True
         sentences = _split_sentences(text)
         windows = _segment_into_windows(sentences)
 
@@ -962,7 +992,7 @@ class PerplexityRiskClassifier:
         score = self._score_from_severity(severity, stats)
         level = self._level(score)
 
-        return {
+        result = {
             "ai_score": score,
             "risk_level": level,
             "severity_profile": severity,
@@ -971,6 +1001,11 @@ class PerplexityRiskClassifier:
             "tier": stats.get("tier", "tier1"),
             "window_count": stats.get("window_count", 0),
         }
+        # Propagate confidence flags set by compute_stats (EC-03, 4.2-Bias-3)
+        for _flag in ("language_warning", "low_confidence", "short_text_warning"):
+            if _flag in stats:
+                result[_flag] = stats[_flag]
+        return result
 
     def _severity_profile(self, stats: Dict[str, float]) -> Dict[str, str]:
         """

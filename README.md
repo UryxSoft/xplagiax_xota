@@ -1,6 +1,6 @@
 # XplagiaX — AI Detection Microservice
 
-Flask microservice for AI-generated text detection. Built around a 4-model ModernBERT ensemble with a modular plugin architecture. Supports per-document segmentation, forensic reports, perplexity analysis, citation verification, zone classification, and more.
+Flask microservice for AI-generated text detection. Built around a 3-model ModernBERT ensemble with a modular plugin architecture. Supports per-document segmentation, forensic reports, perplexity analysis, citation verification, zone classification, streaming analysis, and more.
 
 ---
 
@@ -11,11 +11,12 @@ Client
     │
     │  POST /analyze              {"text": "...", "plugins": ["ai_detection", ...]}
     │  POST /analyze_document     {"text": "...", "plugins": ["ai_detection", ...]}
+    │  POST /analyze_stream       {"text": "...", "plugins": [...]}  (SSE)
     │  POST /api/v2/citations/detect    {"text": "..."}
     │  POST /api/v2/citations/validate  {"text": "..."}
     ▼
 ┌────────────────────────────────────────────────────────────────┐
-│  Gunicorn (preload_app=True + gevent workers)                  │
+│  Gunicorn (preload_app=True + sync workers)                    │
 │                                                                │
 │  Master Process                                                │
 │  ├── ModernBERT ensemble loaded ONCE at module level           │
@@ -27,6 +28,11 @@ Client
 │  │    Worker 1       │  │    Worker 2  ...  │                  │
 │  │  ~50 MB overhead  │  │  ~50 MB overhead  │                  │
 │  └───────────────────┘  └───────────────────┘                  │
+│                                                                │
+│  Redis (optional)                                              │
+│  ├── Rate limit counters (Flask-Limiter)                       │
+│  ├── Result cache (Flask-Caching, 1-hour TTL)                  │
+│  └── Celery broker + result backend                            │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -35,7 +41,7 @@ Client
 | Decision | Rationale |
 |---|---|
 | `preload_app = True` | Models loaded once in master, shared across workers via CoW |
-| `gevent` worker class | Cooperative I/O concurrency, handles hundreds of connections per worker |
+| Sync worker class | Stable under CPU-bound ML inference; no gevent GIL interaction |
 | `OMP_NUM_THREADS=1` | Prevents torch/numpy from spawning per-worker thread explosions |
 | `local_files_only=True` | No HuggingFace network calls on startup — uses local cache |
 | Plugin auto-discovery | Drop a file in `app/plugins/`, restart — zero core changes needed |
@@ -43,12 +49,14 @@ Client
 | Non-root container user | UID 1000, K8s security best practice |
 | `m.share_memory()` on models | POSIX shared memory prevents CoW page faults across workers |
 | CitationDetector module singleton | Instantiated at import time, shared across all workers via CoW |
+| Result cache (sha256 keyed) | Same text + same plugins = 0ms from Redis cache, no re-inference |
+| `analyze_fast()` everywhere | Single-pass tokenization with token-boundary splits; 2–12× faster than chunked inference |
 
 ---
 
 ## Engine — ModernBERT Ensemble
 
-The core classifier (`app/engine/detector_final.py`) loads three fine-tuned ModernBERT models at startup and averages their softmax outputs:
+The core classifier ([app/engine/detector_final.py](app/engine/detector_final.py)) loads three fine-tuned ModernBERT models at startup and averages their softmax outputs:
 
 | File | Labels | Role |
 |---|---|---|
@@ -60,6 +68,8 @@ The 41 label classes include `human` (index 24) and 40 known AI generators (GPT-
 
 The tokenizer and config are loaded from the local HuggingFace cache (`answerdotai/ModernBERT-base`, `local_files_only=True`).
 
+`analyze_fast()` uses adaptive `max_tokens` (capped at sequence length), single-pass tokenization, and token-boundary chunk splitting. Results are cached in a thread-safe TTL dict (`_FAST_CACHE`, 5-minute TTL, 20-entry LRU cap) — calling it again with the same text hits the cache at 0ms.
+
 ---
 
 ## Plugins
@@ -68,7 +78,7 @@ The tokenizer and config are loaded from the local HuggingFace cache (`answerdot
 
 | Plugin name | Description |
 |---|---|
-| `ai_detection` | Binary Human/AI classification — 4-model ModernBERT ensemble. ~2s CPU, ~0.3s GPU. |
+| `ai_detection` | Binary Human/AI classification — 3-model ModernBERT ensemble. ~2s CPU, ~0.3s GPU. |
 | `segment_analysis` | Per-paragraph AI/Human heatmap via `HybridSegmentAnalyzer`. Returns preview (80 chars) per segment. |
 | `perplexity_check` | Text predictability analysis via n-gram proxy (Tier 1, CPU) + optional GPT-2 (Tier 2, GPU). |
 | `stylometric_analysis` | Detailed analysis of writing style: sentence structure, vocabulary richness, and burstiness. |
@@ -99,7 +109,7 @@ class MyPlugin(BasePlugin):
         return {"result": "..."}
 ```
 
-2. Add dependencies to `requirements.txt` if needed.
+2. Add dependencies to `requirements.in` and run `make lock`.
 3. Restart the service — the plugin is auto-discovered with no other changes.
 
 ---
@@ -108,7 +118,7 @@ class MyPlugin(BasePlugin):
 
 ### POST /analyze
 
-Run any combination of plugins on a text.
+Run any combination of plugins on a text. Results are cached by `sha256(text + plugins)` for 1 hour — repeated identical requests return immediately from Redis with `"from_cache": true`.
 
 **Request**
 ```json
@@ -124,6 +134,7 @@ Run any combination of plugins on a text.
     "status": "ok",
     "word_count": 124,
     "plugins_requested": ["ai_detection", "perplexity_check"],
+    "from_cache": false,
     "results": {
         "ai_detection": {
             "status": "ok",
@@ -151,6 +162,12 @@ Run any combination of plugins on a text.
 ```bash
 curl -X POST http://localhost:5006/analyze \
   -H "Content-Type: application/json" \
+  -d '{"text": "Your text here...", "plugins": ["ai_detection"]}'
+
+# With API key authentication
+curl -X POST http://localhost:5006/analyze \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
   -d '{"text": "Your text here...", "plugins": ["ai_detection"]}'
 ```
 
@@ -249,7 +266,7 @@ curl -X POST http://localhost:5006/analyze \
 
 ### POST /analyze_document
 
-Run any combination of plugins on a long document **and** get per-paragraph segment scores. Runs all requested plugins through the same registry as `/analyze`, then always appends per-segment results from `HybridSegmentAnalyzer` into the `ai_detection` result (if `ai_detection` was requested).
+Run any combination of plugins on a long document **and** get per-paragraph segment scores. Uses `analyze_fast()` — single-pass tokenization with token-boundary splitting and 5-minute result cache.
 
 **Request**
 ```json
@@ -316,6 +333,86 @@ curl -X POST http://localhost:5006/analyze_document \
 
 ---
 
+### POST /analyze_stream
+
+Run plugins on a text and receive results as they complete via **Server-Sent Events (SSE)**. Fast plugins (e.g., `zone_classifier`) deliver their result immediately; slow plugins (e.g., `citation_check`) stream in as they finish. No waiting for the slowest plugin.
+
+Rate limit: **30 requests/minute**.
+
+**Request**
+```json
+{
+    "text": "The rapid integration of AI in academic settings...",
+    "plugins": ["ai_detection", "perplexity_check", "zone_classifier"]
+}
+```
+
+**SSE Event Stream**
+```
+data: {"type": "init", "word_count": 124, "plugins": ["ai_detection", "perplexity_check", "zone_classifier"]}
+
+data: {"type": "result", "plugin": "zone_classifier", "result": {"status": "ok", "elapsed_ms": 14.2, "data": {...}}}
+
+data: {"type": "result", "plugin": "perplexity_check", "result": {"status": "ok", "elapsed_ms": 312.5, "data": {...}}}
+
+data: {"type": "result", "plugin": "ai_detection", "result": {"status": "ok", "elapsed_ms": 1823.4, "data": {...}}}
+
+data: {"type": "done"}
+```
+
+```bash
+# curl — stream events to terminal
+curl -N -X POST http://localhost:5006/analyze_stream \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"text": "Your text here...", "plugins": ["ai_detection", "zone_classifier"]}'
+```
+
+```javascript
+// JavaScript EventSource — live updates as plugins complete
+const response = await fetch("http://localhost:5006/analyze_stream", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ text: "Your text...", plugins: ["ai_detection", "zone_classifier"] }),
+});
+
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  const lines = decoder.decode(value).split("\n");
+  for (const line of lines) {
+    if (!line.startsWith("data: ")) continue;
+    const event = JSON.parse(line.slice(6));
+    if (event.type === "result") {
+      console.log(`[${event.plugin}]`, event.result);
+    }
+  }
+}
+```
+
+```python
+import requests
+
+with requests.post(
+    "http://localhost:5006/analyze_stream",
+    json={"text": "Your text...", "plugins": ["ai_detection", "zone_classifier"]},
+    stream=True,
+    headers={"Accept": "text/event-stream"},
+    timeout=120,
+) as resp:
+    for line in resp.iter_lines():
+        if line and line.startswith(b"data: "):
+            import json
+            event = json.loads(line[6:])
+            if event["type"] == "result":
+                print(f"[{event['plugin']}] {event['result']['status']} — {event['result'].get('elapsed_ms')}ms")
+```
+
+---
+
 ### GET /health
 
 Liveness probe — always 200 if the process is alive.
@@ -350,7 +447,7 @@ curl http://localhost:5006/plugins
 
 ### GET /report/\<filename\>
 
-Serve a generated HTML forensic report from `/tmp`.
+Serve a generated HTML forensic report from `/tmp`. Only files with a `forensic_` prefix are served (path traversal + file-type guard). Returns with strict `Content-Security-Policy` and `X-Content-Type-Options: nosniff` headers.
 
 ```bash
 curl http://localhost:5006/report/forensic_abc123.html
@@ -361,6 +458,8 @@ curl http://localhost:5006/report/forensic_abc123.html
 ## Antiplagio — Citation API (`/api/v2/`)
 
 The antiplagio module adds two dedicated citation endpoints that are independent from the plugin system. They are always available (no plugin selection needed).
+
+Rate limits: **60 req/min** for `/detect`, **10 req/min** for `/validate`.
 
 ### POST /api/v2/citations/detect
 
@@ -457,7 +556,7 @@ curl -X POST http://localhost:5006/api/v2/citations/detect \
 
 ### POST /api/v2/citations/validate
 
-Asynchronous bibliography validation. Queries CrossRef, OpenAlex, and Semantic Scholar in parallel for each reference. Requires network access and `aiohttp`.
+Asynchronous bibliography validation. Queries CrossRef, OpenAlex, and Semantic Scholar in parallel for each reference. Requires network access and `aiohttp`. SSRF-protected — only the three academic API hosts are reachable.
 
 **Request — from full text**
 ```json
@@ -568,6 +667,17 @@ curl -X POST http://localhost:5006/analyze \
   }'
 ```
 
+#### Stream results as plugins complete (SSE)
+```bash
+curl -N -X POST http://localhost:5006/analyze_stream \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "text": "Your text here...",
+    "plugins": ["ai_detection", "perplexity_check", "citation_check"]
+  }'
+```
+
 #### Analyze a full document with per-segment breakdown
 ```bash
 curl -X POST http://localhost:5006/analyze_document \
@@ -647,6 +757,32 @@ print(f"Human:       {result['human_percentage']:.2f}%")
 print(f"AI:          {result['ai_percentage']:.2f}%")
 print(f"Model hint:  {result['detected_model']}")
 print(f"Uncertain:   {result['uncertainty_zone']}")
+print(f"From cache:  {data.get('from_cache', False)}")
+```
+
+#### Streaming — receive plugin results as they complete
+```python
+import json
+import requests
+
+with requests.post(
+    "http://localhost:5006/analyze_stream",
+    json={"text": "Your text...", "plugins": ["ai_detection", "perplexity_check", "zone_classifier"]},
+    stream=True,
+    headers={"Accept": "text/event-stream"},
+    timeout=120,
+) as resp:
+    for line in resp.iter_lines():
+        if not line or not line.startswith(b"data: "):
+            continue
+        event = json.loads(line[6:])
+        if event["type"] == "init":
+            print(f"Analyzing {event['word_count']} words with {event['plugins']}")
+        elif event["type"] == "result":
+            r = event["result"]
+            print(f"[{event['plugin']}] {r['status']} — {r.get('elapsed_ms')}ms")
+        elif event["type"] == "done":
+            print("All plugins complete.")
 ```
 
 #### Analyze document with segments
@@ -812,6 +948,25 @@ async function analyzeText(text, plugins = ["ai_detection"]) {
   return response.json();
 }
 
+async function analyzeStream(text, plugins, onResult) {
+  const response = await fetch(`${BASE_URL}/analyze_stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, plugins }),
+  });
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    for (const line of decoder.decode(value).split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      const event = JSON.parse(line.slice(6));
+      onResult(event);
+    }
+  }
+}
+
 async function detectCitations(text) {
   const response = await fetch(`${BASE_URL}/api/v2/citations/detect`, {
     method: "POST",
@@ -829,10 +984,15 @@ Smith et al. (2020) corroborate these findings.
 Referencias
 García, M., & López, J. (2021). Transformación digital. Rev. Ed. Superior, 15(3), 45-67.`;
 
-// AI detection
+// AI detection (cached on second call)
 const aiResult = await analyzeText(text, ["ai_detection"]);
 const ai = aiResult.results.ai_detection.data;
 console.log(`${ai.prediction} — ${ai.confidence.toFixed(2)}%`);
+
+// Streaming
+await analyzeStream(text, ["ai_detection", "zone_classifier"], (event) => {
+  if (event.type === "result") console.log(`[${event.plugin}]`, event.result.status);
+});
 
 // Citation detection
 const citeResult = await detectCitations(text);
@@ -855,7 +1015,9 @@ All endpoints return a JSON error body with an appropriate HTTP status code.
 | `400` | `plugins` is not a non-empty list | `{"error": "'plugins' must be a non-empty list"}` |
 | `400` | `/api/v2/citations/detect` missing `text` | `{"error": "Campo 'text' requerido"}` |
 | `400` | `/api/v2/citations/validate` missing both `text` and `bibliography` | `{"error": "Se requiere 'text' o 'bibliography'"}` |
+| `401` | Missing or invalid `X-API-Key` header (when `API_KEY` is set) | `{"error": "Unauthorized"}` |
 | `415` | Missing `Content-Type: application/json` | `{"error": "Content-Type must be application/json"}` |
+| `429` | Rate limit exceeded | `{"error": "Too Many Requests"}` |
 | `503` | `ai_detection` plugin not loaded | `{"error": "ai_detection plugin not available"}` |
 
 When a plugin runs but fails internally, the response is still `200` and the individual plugin entry will have `"status": "error"`:
@@ -884,8 +1046,9 @@ When a plugin runs but fails internally, the response is still `200` and the ind
 python -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\activate
 
-# 2. Install dependencies
-pip install -r requirements.txt
+# 2. Install dependencies (locked + hash-verified)
+make install
+# or: pip install -r requirements.txt
 
 # 3. Place model files in app/engine/
 #    app/engine/modernbert.bin
@@ -898,6 +1061,21 @@ python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained
 # 5. Start the dev server
 python app.py
 ```
+
+### Dependency management
+
+```bash
+# Update requirements.in with abstract deps (no version pins), then:
+make lock      # pip-compile --generate-hashes → requirements.txt with SHA-256 hashes
+make install   # pip install --require-hashes --no-deps -r requirements.txt
+
+# Run quality gates
+make test      # pytest tests/ -v --tb=short
+make lint      # ruff check app/ tests/
+make typecheck # mypy app/ --ignore-missing-imports
+```
+
+`requirements.in` is the source of truth for abstract dependencies. `requirements.txt` is the compiled, fully-pinned, hash-verified lockfile — commit both files together.
 
 ### Production (gunicorn)
 
@@ -924,18 +1102,20 @@ docker run -d \
   xplagiax_xota:latest
 ```
 
-#### Run — production (with Redis for async tasks + citation validation)
+#### Run — production (with Redis for rate limiting, caching + async tasks)
 
 ```bash
 # 1. Create network (if it doesn't exist)
 docker network create xplagiax-net
 
-# 2. Start Redis
+# 2. Start Redis (with optional password)
 docker run -d \
   --name redis \
   --network xplagiax-net \
   -p 6379:6379 \
-  redis:7-alpine
+  -e REDIS_PASSWORD=your-redis-password \
+  redis:7-alpine \
+  sh -c 'if [ -n "$REDIS_PASSWORD" ]; then redis-server --requirepass "$REDIS_PASSWORD"; else redis-server; fi'
 
 # 3. Stop any existing container
 docker stop xplagiax-xota 2>/dev/null || true
@@ -948,10 +1128,15 @@ docker run -d \
   --restart unless-stopped \
   -p 5006:5006 \
   -e WEB_CONCURRENCY=2 \
-  -e REDIS_URL="redis://redis:6379" \
-  -e CELERY_BROKER_URL="redis://redis:6379/0" \
-  -e CELERY_RESULT_BACKEND="redis://redis:6379/1" \
-  -e CROSSREF_EMAIL="your@email.com" \
+  -e FLASK_ENV=production \
+  -e SECRET_KEY=your-secret-key \
+  -e API_KEY=your-api-key \
+  -e REDIS_URL="redis://:your-redis-password@redis:6379" \
+  -e REDIS_PASSWORD=your-redis-password \
+  -e REDIS_MAX_CONNECTIONS=10 \
+  -e CELERY_BROKER_URL="redis://:your-redis-password@redis:6379/0" \
+  -e CELERY_RESULT_BACKEND="redis://:your-redis-password@redis:6379/1" \
+  -e CROSSREF_EMAIL="your@institution.edu" \
   -e LOG_LEVEL=info \
   xplagiax_xota:latest
 
@@ -971,7 +1156,7 @@ docker run -d \
   -v /path/to/models:/app/app/engine \
   -e WEB_CONCURRENCY=2 \
   -e REDIS_URL="redis://redis:6379" \
-  -e CROSSREF_EMAIL="your@email.com" \
+  -e CROSSREF_EMAIL="your@institution.edu" \
   xplagiax_xota:latest
 ```
 
@@ -983,6 +1168,10 @@ docker run -d \
 
 | Variable | Default | Description |
 |---|---|---|
+| `FLASK_ENV` | `development` | Set to `production` to enable production guards (requires SECRET_KEY, API_KEY) |
+| `SECRET_KEY` | _(auto-generated)_ | Flask session secret. **Required in production.** Generate: `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `API_KEY` | _(empty)_ | API key for `X-API-Key` header authentication. Empty = auth disabled. **Required in production.** |
+| `DEBUG` | `0` | Set to `1` to enable Flask debug mode. Blocked in production (Werkzeug RCE risk). |
 | `WEB_CONCURRENCY` | `2×CPU (max 8)` | Number of gunicorn workers |
 | `GUNICORN_TIMEOUT` | `120` | Hard worker kill timeout (seconds) |
 | `GRACEFUL_TIMEOUT` | `30` | Soft shutdown window (seconds) |
@@ -994,10 +1183,13 @@ docker run -d \
 | `REFERENCE_NETWORK` | `1` | Enable live citation network calls (`0` to disable) |
 | `ENABLE_REFERENCE_CHECK` | `0` | Include citation check in `full_analysis` pipeline |
 | `ENABLE_WATERMARK` | `0` | Include watermark detection in `full_analysis` pipeline |
-| `CACHE_TYPE` | `SimpleCache` | Flask-Caching backend |
-| `CACHE_TIMEOUT` | `300` | Cache TTL in seconds |
-| `CELERY_BROKER_URL` | `redis://localhost:6379/0` | Celery broker URL (optional async queue) |
-| `CROSSREF_EMAIL` | `antiplagio@example.com` | Email sent to CrossRef Polite Pool API for citation validation |
+| `REDIS_URL` | `redis://redis:6379` | Redis connection URL (rate limiter + cache + Celery) |
+| `REDIS_PASSWORD` | _(empty)_ | Redis password — appended to connection URL when set |
+| `REDIS_MAX_CONNECTIONS` | `10` | Redis connection pool cap per process |
+| `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker URL |
+| `CELERY_RESULT_BACKEND` | `redis://redis:6379/1` | Celery result backend URL |
+| `CROSSREF_EMAIL` | `antiplagio@example.com` | Email sent to CrossRef Polite Pool. **Set to a real institutional address in production.** |
+| `GUNICORN_SPAWN_CELERY` | `1` | Spawn an internal Celery worker from the gunicorn master (`0` to disable for separate worker deployment) |
 
 ---
 
@@ -1007,20 +1199,23 @@ docker run -d \
 xplagiax_xota/
 ├── app.py                        # Entry point — gunicorn target
 ├── gunicorn.conf.py              # Production server config
-├── requirements.txt              # Python dependencies
+├── requirements.in               # Abstract (unpinned) dependencies — source of truth
+├── requirements.txt              # Compiled lockfile with SHA-256 hashes (pip-compile output)
+├── Makefile                      # lock / install / test / lint / typecheck targets
 ├── Dockerfile                    # Multi-stage container build
+├── docker-compose.yml            # Full stack: web + celery + redis
 │
 ├── app/
-│   ├── __init__.py               # create_app() factory
-│   ├── config.py                 # All config via env vars
-│   ├── routes.py                 # API blueprints (/analyze, /analyze_document, ...)
+│   ├── __init__.py               # create_app() factory + security guards
+│   ├── config.py                 # All config via env vars (12-factor)
+│   ├── routes.py                 # API blueprints (/analyze, /analyze_document, /analyze_stream, ...)
 │   ├── tasks.py                  # Celery background tasks
 │   ├── celery_app.py             # Celery worker entry point
-│   ├── plugin_registry.py        # Auto-discovery and dispatch
+│   ├── plugin_registry.py        # Auto-discovery, parallel dispatch, run_stream() SSE
 │   │
 │   ├── antiplagio/               # Citation detection and validation package
 │   │   ├── __init__.py
-│   │   ├── flask_routes.py       # Blueprint /api/v2/ (detect + validate endpoints)
+│   │   ├── flask_routes.py       # Blueprint /api/v2/ (detect + validate, rate-limited)
 │   │   └── citation/
 │   │       ├── __init__.py
 │   │       ├── detector.py       # CitationDetector — regex + spaCy fallback
@@ -1036,30 +1231,89 @@ xplagiax_xota/
 │   │   ├── reasoning_check.py     # Reasoning-model detection (o1/R1)
 │   │   ├── citation_check.py     # Reference existence verification
 │   │   ├── watermark_detection.py # Digital watermark detection
-│   │   ├── zone_classifier.py    # Citation zone detection plugin (NEW)
-│   │   ├── forensic_report.py    # HTML forensic report generation
-│   │   └── full_analysis.py      # Complete forensic pipeline
+│   │   ├── zone_classifier.py    # Citation zone detection plugin
+│   │   ├── forensic_report.py    # HTML forensic report (decoupled via get_orchestrator())
+│   │   └── full_analysis.py      # Complete forensic pipeline (orchestrator singleton)
 │   │
-│   └── engine/                   # XplagiaX core — unmodified engine files
+│   └── engine/                   # XplagiaX core engine
 │       ├── __init__.py           # sys.path setup + torch/transformers patch
-│       ├── detector_final.py     # 4-model ModernBERT ensemble
+│       ├── detector_final.py     # 3-model ModernBERT ensemble + analyze_fast() + TTL cache
 │       ├── hybrid_segment_detector.py   # Sliding-window segment classifier
 │       ├── perplexity_profiler.py       # n-gram + GPT-2 perplexity
 │       ├── stylometric_profiler.py      # Writing style fingerprinting
 │       ├── hallucination_profile.py     # Fabrication risk detection
 │       ├── reasoning_profiler.py        # Reasoning-model detection
-│       ├── reference_validator.py       # Citation verification
+│       ├── reference_validator.py       # Citation verification (SSRF-protected)
 │       ├── watermark_decoder.py         # Digital watermark detection
 │       ├── forensic_reports.py          # HTML/JSON report generator (v3.9)
-│       ├── plugin_orchestrator.py       # Full pipeline coordinator
+│       ├── plugin_orchestrator.py       # Pipeline coordinator + singleton factory
 │       ├── modernbert.bin               # Model weights (~600 MB)
 │       ├── Model_groups_3class_seed12   # Model weights (~600 MB)
 │       └── Model_groups_3class_seed22   # Model weights (~600 MB)
 │
 └── tests/
     ├── __init__.py
-    └── test_citation_system.py   # 24 pytest tests for CitationDetector
+    ├── conftest.py
+    └── test_citation_system.py   # pytest tests for CitationDetector
 ```
+
+---
+
+## Security Hardening (May 2026)
+
+| ID | Severity | Module | Fix Applied |
+|---|---|---|---|
+| S-01 | **HIGH** | `app/routes.py` | `hmac.compare_digest()` for timing-safe API key comparison — prevents timing-attack key enumeration. |
+| S-02 | **HIGH** | `app/__init__.py` | Startup `RuntimeError` if `DEBUG=True` and `FLASK_ENV=production` — blocks Werkzeug interactive debugger (remote code execution risk). |
+| S-03 | **HIGH** | `app/routes.py` | `X-Request-ID` sanitized — only alphanumeric + hyphens accepted from caller header; generated UUID otherwise. |
+| S-04 | **MEDIUM** | `app/routes.py` | Content-type enforcement — all POST endpoints return `415` if `Content-Type` is not `application/json`. |
+| S-05 | **HIGH** | `app/__init__.py` | Startup `RuntimeError` if `API_KEY` is empty in production; `WARNING` log in development so the misconfiguration is visible. |
+| S-06 | **HIGH** | `app/engine/reference_validator.py` | SSRF protection — `_ALLOWED_API_HOSTS` allowlist (CrossRef, OpenAlex, Semantic Scholar) + `_NoRedirectHandler` blocks redirect chains before any HTTP request is made. |
+| S-07 | **MEDIUM** | `app/antiplagio/citation/validator.py` | External URL validation before aiohttp requests — scheme must be `https`, host must be in the academic API allowlist. |
+| S-08 | **MEDIUM** | `app/routes.py` | `serve_report()` validates `forensic_` prefix on filename before serving from `/tmp`. Adds strict `Content-Security-Policy` and `X-Content-Type-Options: nosniff` response headers. |
+| S-09 | **MEDIUM** | `docker-compose.yml` | Redis `requirepass` is conditional — runs `redis-server --requirepass $REDIS_PASSWORD` only when the env var is set, safe for dev without a password. |
+| S-10 | **LOW** | `app/routes.py` | `word_count` capped at 200,000 words before processing — prevents memory exhaustion on pathologically large inputs. |
+| S-11 | **MEDIUM** | `Dockerfile` | Build-stage `sed` narrowed to `/^torch/d` only — previously removed `numpy`, `transformers`, `spacy` version pins, leaving them unconstrained in the runtime image. |
+| S-12 | **LOW** | `app/__init__.py` | Startup `WARNING` if `CROSSREF_EMAIL` ends with `@example.com` — CrossRef Polite Pool throttles or blocks example.com addresses. |
+
+---
+
+## Technical Debt Resolved (May 2026)
+
+| ID | Severity | Module | Problem | Fix |
+|---|---|---|---|---|
+| DT-01 | **CRITICAL** | `app/tasks.py` | Double inference: task ran full ML pipeline after plugin already ran it. | Reuse plugin `segments`; fall back only when `ai_detection` not requested. |
+| DT-02 | **CRITICAL** | `app/engine/detector_final.py` | CoW violation: PyTorch ref-counting duplicated 1.71 GB of model weights per worker (3 workers = 5.1 GB). | `m.share_memory()` after each model load → POSIX shared memory, no CoW faults. |
+| DT-03 | **HIGH** | `app/tasks.py` | Redis result bloat: base64 chart fields (300 KB–1 MB each) serialized into Celery results with 1h TTL. | `_strip_base64()` helper strips all `*_b64` keys before Redis serialization. |
+| DT-04 | **HIGH** | `app/celery_app.py` | Celery result TTL 3600s allowed 1h of large results to accumulate. | Reduced `result_expires` to 600s (10 min). |
+| DT-05 | **HIGH** | `app/antiplagio/flask_routes.py` | No rate limits on `/api/v2/citations/` routes. | `@limiter.limit("60/minute")` on `detect_citations`; `@limiter.limit("10/minute")` on `validate_citations`. |
+| DT-06 | **HIGH** | `app/antiplagio/citation/detector.py` | Multi-citation parentheticals `(A, 2021; B, 2020)` silently dropped — `APA_INLINE` only matched single-author pairs. | Added `APA_MULTI_PAREN` regex; preprocessing splits semicolons into individual `CitationMarker` objects. |
+| DT-07 | **HIGH** | `app/antiplagio/citation/detector.py` | `import spacy` crash if spaCy not installed — entire citation module failed to load. | Separated import from `spacy.load()`. `ImportError`/`OSError` sets `_SPACY_AVAILABLE=False`, falls back to rule-based segmentation. |
+| DT-08 | **MEDIUM** | `app/antiplagio/citation/validator.py` | Unconditional `import aiohttp` — module failed to import if `aiohttp` not installed. | `try/except ImportError` → `_AIOHTTP_AVAILABLE=False`; `validate_all()` returns `ERROR` results gracefully. |
+| DT-09 | **MEDIUM** | `app/antiplagio/flask_routes.py` | `async_route` decorator leaked event loop into gevent global state — no `asyncio.set_event_loop(None)` after `loop.close()`. | Added `asyncio.set_event_loop(None)` in `finally` block. |
+| DT-10 | **MEDIUM** | `app/antiplagio/flask_routes.py` | Dead code in `validate_citations`: `_split_bibliography()` result discarded after computation. | Removed unused call; `bibliography` obtained directly from `analysis.bibliography`. |
+| DT-11 | **LOW** | `app/plugins/zone_classifier.py` | `CitationDetector()` instantiated per-request, rebuilding all compiled regex patterns on every call. | Moved to module level — singleton shared across workers via CoW. |
+| DT-12 | **MEDIUM** | `app/plugins/forensic_report.py` | Tight coupling to `full_analysis._orchestrator` (private attribute import) — circular dependency risk. | `forensic_report.py` now calls `get_orchestrator()` from `app.engine.plugin_orchestrator`. No private attribute access. |
+| DT-13 | **LOW** | `app/__init__.py` | No request correlation ID — log lines from parallel requests were impossible to correlate. | `X-Request-ID` set in `before_request` (from caller header or generated UUID); echoed in `after_request`. |
+| DT-14 | **MEDIUM** | `app/engine/plugin_orchestrator.py` | No public API for `ForensicReportGenerator.export_html` — callers accessed `_forensic_generator` directly. | Added `export_html(self, forensic_report, output_path)` public method + module-level singleton factory (`initialize_orchestrator` / `get_orchestrator`). |
+| DT-15 | **MEDIUM** | `app/routes.py` | `analyze_document` called deprecated `analyze_long_document()` — repeated tokenization per chunk, no embedding reuse, 2–12× slower than `analyze_fast()`. | Replaced with `analyze_fast(text)` — single-pass tokenization, adaptive `max_tokens`, token-boundary splits, TTL result cache. |
+
+---
+
+## Performance Improvements (May 2026)
+
+| ID | Module | Improvement |
+|---|---|---|
+| P-01 | `app/plugin_registry.py` | `ThreadPoolExecutor` max_workers raised to 8 — ML plugins release GIL during C-level inference, so threads run truly in parallel on multi-core machines. |
+| P-02 | `app/plugin_registry.py` | Per-plugin individual timeout in `future.result(timeout=...)` — each plugin gets its full budget; a slow plugin can't starve others checked later. |
+| P-03 | `app/plugin_registry.py` | `run_stream()` generator using `as_completed()` — clients receive fast plugin results immediately without waiting for the slowest plugin. |
+| P-04 | `app/routes.py` | Result cache: `sha256(text + plugins)` keyed in Redis/SimpleCache with 1h TTL. Repeat requests: 0ms inference, immediate response, `"from_cache": true`. |
+| P-05 | `app/routes.py` | `analyze_document` replaced deprecated chunked `analyze_long_document` with `analyze_fast()` — single tokenization pass, 2–12× faster for long documents. |
+| P-06 | `app/engine/detector_final.py` | `analyze_fast()` uses adaptive `max_tokens` (capped at actual sequence length) — no padding waste for short texts. |
+| P-07 | `app/engine/detector_final.py` | Thread-safe TTL cache for `analyze_fast()` results (`_FAST_CACHE`, 5-min TTL, 20-entry LRU) — multiple plugins requesting same text in one request hit cache on second call. |
+| P-08 | `app/config.py` | Redis connection pool cap via `CACHE_OPTIONS = {"max_connections": N}` — prevents runaway connections under burst traffic. |
+| P-09 | `app/__init__.py` | Rate limiter `storage_options = {"max_connections": N}` — same pool cap for the limiter's Redis client. |
+| P-10 | `requirements.in` / `Makefile` | `pip-compile --generate-hashes` infrastructure — supply-chain-safe SHA-256 hash pinning without manual maintenance. |
 
 ---
 
@@ -1067,16 +1321,18 @@ xplagiax_xota/
 
 | # | Severity | Module | Bug / Problem | Fix Applied |
 |---|---|---|---|---|
-| 1 | **CRITICAL** | `app/tasks.py` | Redundant double inference: `analyze_document_async` ran `analyze_long_document()` **after** `ai_detection` plugin had already performed identical inference via `analyze_long_documentsd_()`. Every request ran model inference twice. | Reuse `segments` already computed by the plugin. Fall back to `analyze_long_documentsd_()` only when `ai_detection` was not requested. |
+| 1 | **CRITICAL** | `app/tasks.py` | Redundant double inference: `analyze_document_async` ran `analyze_long_document()` **after** `ai_detection` plugin had already performed identical inference. Every request ran model inference twice. | Reuse `segments` already computed by the plugin. Fall back to direct inference only when `ai_detection` was not requested. |
 | 2 | **CRITICAL** | `app/engine/detector_final.py` | Copy-on-Write violation: PyTorch's internal reference counting wrote to the same virtual pages as model weights on first inference, causing all 1.71 GB of weights to be duplicated per worker. With 2 web + 1 Celery worker = 5.13 GB extra. | Added `m.share_memory()` after each model load. Moves tensor storage to POSIX shared memory — read-only across all forked processes, no CoW faults. |
-| 3 | **HIGH** | `app/tasks.py` | Redis result bloat: Celery serialized full task results including `heatmap_b64`, `confidence_chart_b64`, `comparison_chart_b64` (300 KB–1 MB each). With 1-hour TTL, accumulated hundreds of MB under load. | Added `_strip_base64()` helper to remove all `*_b64` keys before Redis serialization. HTML report in `/tmp` already contains the charts. |
+| 3 | **HIGH** | `app/tasks.py` | Redis result bloat: Celery serialized full task results including `heatmap_b64`, `confidence_chart_b64`, `comparison_chart_b64` (300 KB–1 MB each). With 1-hour TTL, accumulated hundreds of MB under load. | Added `_strip_base64()` helper to remove all `*_b64` keys before Redis serialization. |
 | 4 | **HIGH** | `app/celery_app.py` | Celery result TTL of 3600s allowed 1 hour of large results to accumulate in Redis simultaneously under moderate load. | Reduced `result_expires` from 3600s to 600s (10 minutes). |
-| 5 | **HIGH** | `app/antiplagio/citation/detector.py` | Multi-citation parentheticals `(García, 2021; López, 2020; Martínez, 2019)` were not detected — `APA_INLINE` requires a single author-year pair per parenthetical, so semicolon-separated citations were silently dropped. | Added `APA_MULTI_PAREN` regex pattern. Processing block at start of `_detect_inline_citations` splits semicolon-separated parts into individual `CitationMarker` objects. Original loop skips already-processed spans. |
-| 6 | **HIGH** | `app/antiplagio/citation/detector.py` | spaCy import failure would crash the entire module if `spacy` was not installed, preventing citation detection from working at all. | Separated `import spacy` from `spacy.load()`. `ImportError` sets `_SPACY_AVAILABLE = False` and falls back to rule-based sentence segmentation. `OSError` on model load (model not downloaded) also falls back gracefully. |
-| 7 | **MEDIUM** | `app/antiplagio/citation/validator.py` | `aiohttp` dependency was unconditional — if not installed, the entire validator module failed to import. | Wrapped in `try/except ImportError`. `_AIOHTTP_AVAILABLE = False` when missing. `validate_all()` returns `ValidationStatus.ERROR` results instead of crashing. |
-| 8 | **MEDIUM** | `app/antiplagio/flask_routes.py` | `async_route` decorator leaked event loop into gevent's global state: did not call `asyncio.set_event_loop(None)` after cleanup, risking interference between requests under concurrent load. | Added `asyncio.set_event_loop(None)` in the `finally` block after `loop.close()`. |
-| 9 | **MEDIUM** | `app/antiplagio/flask_routes.py` | Dead code in `validate_citations`: unused `_, bib_text = detector.segmenter._split_bibliography(...)` called and discarded the result, wasting CPU. | Removed unused call. `bibliography` is now obtained directly from `analysis.bibliography`. |
-| 10 | **LOW** | `app/plugins/zone_classifier.py` | CitationDetector was instantiated inside every `analyze()` call — each request rebuilt all compiled regex patterns, wasting CPU on every plugin invocation. | Moved `_detector = CitationDetector()` to module level. Singleton instantiated once at gunicorn preload, shared across workers via CoW. `warmup()` is a no-op. |
+| 5 | **HIGH** | `app/antiplagio/citation/detector.py` | Multi-citation parentheticals `(García, 2021; López, 2020; Martínez, 2019)` were not detected — `APA_INLINE` requires a single author-year pair per parenthetical. | Added `APA_MULTI_PAREN` regex pattern. Processing block splits semicolon-separated citations into individual `CitationMarker` objects. |
+| 6 | **HIGH** | `app/antiplagio/citation/detector.py` | spaCy import failure would crash the entire module if `spacy` was not installed. | Separated `import spacy` from `spacy.load()`. `ImportError` sets `_SPACY_AVAILABLE = False` and falls back to rule-based sentence segmentation. |
+| 7 | **MEDIUM** | `app/antiplagio/citation/validator.py` | `aiohttp` dependency was unconditional — if not installed, the entire validator module failed to import. | Wrapped in `try/except ImportError`. `_AIOHTTP_AVAILABLE = False` when missing. |
+| 8 | **MEDIUM** | `app/antiplagio/flask_routes.py` | `async_route` decorator leaked event loop — no `asyncio.set_event_loop(None)` after `loop.close()`, risking interference between concurrent requests. | Added `asyncio.set_event_loop(None)` in the `finally` block. |
+| 9 | **MEDIUM** | `app/antiplagio/flask_routes.py` | Dead code in `validate_citations`: `_split_bibliography()` result computed and discarded, wasting CPU. | Removed unused call. `bibliography` obtained directly from `analysis.bibliography`. |
+| 10 | **LOW** | `app/plugins/zone_classifier.py` | `CitationDetector()` instantiated inside every `analyze()` call — rebuilt all compiled regex patterns per request. | Moved to module level — singleton instantiated once at gunicorn preload, shared via CoW. |
+| 11 | **HIGH** | `app/engine/reference_validator.py` | No SSRF protection — any URL could be passed to the citation validator, allowing internal network probing. | Added `_ALLOWED_API_HOSTS` allowlist + `_NoRedirectHandler` that blocks HTTP redirects before the first request lands. |
+| 12 | **MEDIUM** | `app/routes.py` | `serve_report()` served any file from `/tmp` by basename — no file-type guard, no security headers. | Added `forensic_` prefix validation; added `Content-Security-Policy` and `X-Content-Type-Options: nosniff` headers. |
 
 ---
 
@@ -1100,9 +1356,9 @@ Celery tasks are configured to prevent memory leaks and zombie processes during 
 * **Auto-Restart:** A `child_exit` hook monitors the internal Celery worker and automatically restarts it if it crashes due to an OOM or segfault.
 
 ### 4. Concurrency & Capacity Limits
-* **Memory Leak Prevention:** The explicit `gc.collect()` after each analysis ensures no "residue" memory or orphaned tensors remain. RAM usage will briefly spike during inference (forward pass) but will immediately drop back down, guaranteeing stable memory footprint over weeks of uptime.
+* **Memory Leak Prevention:** The explicit `gc.collect()` after each analysis ensures no "residue" memory or orphaned tensors remain.
 * **Simultaneous Users:** The system is strictly capped to process **3 concurrent heavy analyses** at exactly the same time (2 Web Workers + 1 Celery Worker).
-* **Queuing:** If 50-100 users submit a 500-word document simultaneously, the system will *not* crash. It will process 3 immediately while safely queuing the remaining requests in Redis (for async) or Gunicorn's backlog. At a rate of ~2-3 seconds per 500-word document, a single Celery worker can process ~20-30 documents per minute seamlessly in the background.
+* **Queuing:** If 50–100 users submit simultaneously, the system will not crash. It will process 3 immediately while safely queuing the remaining requests in Redis (async) or Gunicorn's backlog.
 
 ### Deploying the Optimized Container
 
@@ -1122,10 +1378,13 @@ docker run -d \
   --restart unless-stopped \
   -p 5006:5006 \
   -e WEB_CONCURRENCY=2 \
+  -e FLASK_ENV=production \
+  -e SECRET_KEY=your-secret-key \
+  -e API_KEY=your-api-key \
   -e REDIS_URL="redis://redis:6379" \
   -e CELERY_BROKER_URL="redis://redis:6379/0" \
   -e CELERY_RESULT_BACKEND="redis://redis:6379/1" \
-  -e CROSSREF_EMAIL="your@email.com" \
+  -e CROSSREF_EMAIL="your@institution.edu" \
   xplagiax_xota:latest
 
 # 4. Verify the internal Celery worker is running alongside Gunicorn
@@ -1152,7 +1411,15 @@ docker exec xplagiax-xota ps aux | grep -E "gunicorn|celery"
 
 **4. Citation validation returns `error` status**
 * **Cause:** `aiohttp` is not installed, or the container has no outbound network access.
-* **Fix:** Verify `aiohttp>=3.9.0` is in `requirements.txt` and rebuild. Check Docker network policy with `docker inspect xplagiax-xota`.
+* **Fix:** Verify `aiohttp>=3.9.0` is in `requirements.in` and run `make lock && make install`. Check Docker network policy with `docker inspect xplagiax-xota`.
+
+**5. Startup error: `API_KEY must be set in production`**
+* **Cause:** `FLASK_ENV=production` is set but `API_KEY` env var is missing.
+* **Fix:** Generate a key and pass it via `docker run -e API_KEY=...` or your `.env` file.
+
+**6. Startup error: `DEBUG=True is forbidden in production`**
+* **Cause:** `DEBUG=1` and `FLASK_ENV=production` are set simultaneously.
+* **Fix:** Remove `DEBUG=1` from the production environment.
 
 ---
 
@@ -1170,7 +1437,7 @@ Deep forensic analysis of why the container consumed **2.7 GB at baseline** and 
 | PyTorch runtime + libs | ~350 MB | Imported with the models |
 | Transformers + Tokenizers | ~100 MB | HuggingFace local cache |
 | spaCy + NLTK | ~80 MB | Pre-downloaded in Dockerfile |
-| Flask + Celery + 86 packages | ~100 MB | `requirements.txt` |
+| Flask + Celery + packages | ~100 MB | `requirements.txt` |
 | Docker OS + Python 3.12 slim | ~200 MB | Base image |
 | **Total baseline** | **~2.5–2.7 GB** | — |
 
@@ -1216,10 +1483,22 @@ spec:
           env:
             - name: WEB_CONCURRENCY
               value: "2"
+            - name: FLASK_ENV
+              value: "production"
             - name: LOG_LEVEL
               value: "info"
             - name: CROSSREF_EMAIL
-              value: "your@email.com"
+              value: "your@institution.edu"
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: xplagiax-secrets
+                  key: secret-key
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: xplagiax-secrets
+                  key: api-key
           resources:
             requests:
               memory: "3Gi"

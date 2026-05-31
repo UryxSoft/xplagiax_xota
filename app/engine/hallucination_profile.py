@@ -986,6 +986,7 @@ class HallucinationRiskClassifier:
         return {
             "overall_risk": round(overall, 4),
             "risk_level": level,
+            "classifier_type": "heuristic",  # 4.2-Bias-4: fixed weights, no empirical training
             "category_scores": {
                 k: round(v, 4) for k, v in categories.items()
             },

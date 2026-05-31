@@ -6,19 +6,40 @@ so the service starts with zero env vars for local development.
 """
 
 import os
+import secrets
+
+
+def _require_secret_key() -> str:
+    """Return SECRET_KEY from env, generating a secure fallback for local dev only."""
+    key = os.environ.get("SECRET_KEY", "")
+    if key:
+        return key
+    if os.environ.get("FLASK_ENV", "development") == "production":
+        raise RuntimeError(
+            "SECRET_KEY environment variable is required in production. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+    # Local development only — ephemeral key, never persisted
+    return secrets.token_hex(32)
 
 
 class Config:
     # ── Flask ──────────────────────────────────────────────────────
-    SECRET_KEY =  "edw-32fdx-34f421-m56e"
-    DEBUG =  "1"
+    SECRET_KEY = _require_secret_key()
+    DEBUG = os.environ.get("DEBUG", "0") == "1"
 
     # ── Limits ─────────────────────────────────────────────────────
-    MAX_CONTENT_LENGTH = 16 * 1024 * 1024
+    MAX_CONTENT_LENGTH = 2 * 1024 * 1024
 
     # ── Caching (Flask-Caching) ────────────────────────────────────
-    CACHE_TYPE =  "SimpleCache"
+    # RedisCache is shared across all gunicorn workers; SimpleCache is per-process
+    # and misses 50%+ of requests in multi-worker deployments.
+    CACHE_TYPE = "RedisCache" if os.environ.get("REDIS_URL") else "SimpleCache"
+    CACHE_REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
     CACHE_DEFAULT_TIMEOUT = 300
+    # Explicit pool cap — prevents runaway connections under burst traffic.
+    REDIS_MAX_CONNECTIONS = int(os.environ.get("REDIS_MAX_CONNECTIONS", "10"))
+    CACHE_OPTIONS = {"max_connections": REDIS_MAX_CONNECTIONS}
 
     # ── Compression (Flask-Compress) ───────────────────────────────
     COMPRESS_ALGORITHM = "gzip"

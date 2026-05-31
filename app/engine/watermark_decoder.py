@@ -188,7 +188,7 @@ class WatermarkSignature:
         """
         return {
             "detected": self.detected,
-            "confidence": self.confidence if self.detected else 0.0,
+            "confidence": self.confidence,
             "scheme_type": self.scheme_type,
             "z_score": self.z_score,
             "p_value": self.p_value,

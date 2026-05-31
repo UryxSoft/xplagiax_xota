@@ -1,10 +1,22 @@
 services:
 
   # ── 1. Redis broker / result backend ────────────────────────────
+  # S-09: set REDIS_PASSWORD in the environment (or a .env file) to enable
+  # Redis authentication. Without it, Redis runs without a password (dev only).
   redis:
     image: redis:7-alpine
     container_name: xplagiax_redis
     restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command: >
+      sh -c '
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          exec redis-server --requirepass "$$REDIS_PASSWORD"
+        else
+          exec redis-server
+        fi
+      '
     networks:
       - xplagiax-net
     healthcheck:
@@ -22,7 +34,9 @@ services:
     ports:
       - "5006:5006"
     environment:
-      REDIS_URL: "redis://redis:6379"
+      # When REDIS_PASSWORD is set, override REDIS_URL to include the password:
+      # REDIS_URL=redis://:yourpassword@redis:6379
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     networks:
       - xplagiax-net
     depends_on:
@@ -47,7 +61,7 @@ services:
       --concurrency=1
       --pool=solo
     environment:
-      REDIS_URL: "redis://redis:6379"
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     networks:
       - xplagiax-net
     depends_on:

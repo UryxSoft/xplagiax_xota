@@ -1,0 +1,30 @@
+# requirements.in — abstract (unpinned) dependencies.
+# DO NOT install this file directly.
+# Run `make lock` to compile requirements.txt with full version pins + SHA-256 hashes.
+
+aiohttp>=3.9.0
+amqp>=5.3.1
+anyio>=4.0.0
+billiard>=4.2.4
+blinker>=1.9.0
+brotli>=1.2.0
+cachelib>=0.13.0
+celery>=5.4.0
+Flask>=3.1.1
+Flask-Caching>=2.3.1
+Flask-Compress>=1.17
+Flask-Limiter>=3.5.0
+gunicorn>=23.0.0
+huggingface_hub>=0.36.2
+matplotlib>=3.10.8
+nltk>=3.9.1
+numpy>=1.26.4,<2.0
+python-dotenv>=1.1.0
+redis>=5.3.1
+requests>=2.33.1
+scipy>=1.17.1
+spacy>=3.7.0
+torch>=2.2.2,<2.3
+tokenizers>=0.21.4
+transformers>=4.48.2,<5.0
+Werkzeug>=3.1.8

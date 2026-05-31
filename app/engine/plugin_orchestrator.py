@@ -67,8 +67,17 @@ Usage
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import os
+import tempfile
+import uuid
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+
+def _unique_report_path() -> str:
+    """DT-12: unique per-instance path prevents concurrent report overwrites."""
+    report_dir = os.path.join(tempfile.gettempdir(), "xplagiax_reports")
+    return os.path.join(report_dir, f"forensic_{uuid.uuid4().hex[:8]}.html")
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +114,7 @@ class PluginConfig:
     enable_reference_check: bool = False    # [NEW v3.9] Citation validator (requires network)
     enable_watermark:       bool = False
     enable_forensic_report: bool = True
-    forensic_output_path:   str  = "forensic_report.html"
+    forensic_output_path:   str  = field(default_factory=_unique_report_path)
     forensic_output_format: str  = "html"
     watermark_device:       Optional[str] = None
     perplexity_dict_path:   Optional[str] = None   # [NEW v3.7] Pre-built n-gram dict
@@ -227,8 +236,7 @@ class PluginOrchestrator:
                     enable_tier2=cfg.perplexity_tier2,
                 )
                 self._perplexity_classifier = PerplexityRiskClassifier()
-                tier = "tier2" if (self._perplexity_profiler._gpt2 is not None
-                                   and self._perplexity_profiler._gpt2._available) else "tier1"
+                tier = getattr(self._perplexity_profiler, "tier", "tier1")
                 logger.info("PerplexityProfiler loaded (%s)", tier)
             except ImportError as exc:
                 logger.warning("PerplexityProfiler unavailable: %s", exc)
@@ -361,8 +369,8 @@ class PluginOrchestrator:
                     ppl_analysis["window_ppls"] = ppl_stats.get("window_ppls", [])
                     ppl_analysis["tokens_analysed"] = ppl_stats.get("tokens_analysed", 0)
                     ppl_analysis["feature_values"] = {
-                        k: ppl_stats[k] for k in ppl_stats
-                        if isinstance(ppl_stats[k], (int, float))
+                        k: v for k, v in ppl_stats.items()
+                        if isinstance(v, (int, float))
                     }
                     additional["perplexity"] = ppl_analysis
                 else:
@@ -590,3 +598,28 @@ class PluginOrchestrator:
 
         lines += ["", f"  Active plugins: {', '.join(self.active_plugins())}", sep]
         return "\n".join(lines)
+
+    def export_html(self, forensic_report: Any, output_path: str) -> None:
+        """Export a ForensicReport to HTML. Public wrapper — avoids callers touching _forensic_generator."""
+        if self._forensic_generator is None:
+            raise RuntimeError("ForensicReportGenerator not loaded in this orchestrator")
+        self._forensic_generator.export_html(forensic_report, output_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Module-level singleton factory
+# ═══════════════════════════════════════════════════════════════════════════
+
+_shared_orchestrator: Optional[PluginOrchestrator] = None
+
+
+def initialize_orchestrator(config: PluginConfig) -> PluginOrchestrator:
+    """Create and cache the shared orchestrator. Call once at gunicorn preload."""
+    global _shared_orchestrator
+    _shared_orchestrator = PluginOrchestrator(config)
+    return _shared_orchestrator
+
+
+def get_orchestrator() -> Optional[PluginOrchestrator]:
+    """Return the shared orchestrator, or None if not yet initialized."""
+    return _shared_orchestrator

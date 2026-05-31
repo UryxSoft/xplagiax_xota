@@ -16,6 +16,11 @@ import tempfile
 import time
 from typing import Any, Dict
 
+# P-06: dedicated subdirectory reduces glob() scope from all of /tmp to
+# only our reports — O(F_total) → O(F_forensic), grows more slowly.
+_REPORT_DIR = os.path.join(tempfile.gettempdir(), "xplagiax_reports")
+os.makedirs(_REPORT_DIR, mode=0o700, exist_ok=True)
+
 
 def _cleanup_old_reports(directory: str, prefix: str, max_age_seconds: int) -> None:
     """Delete report files older than max_age_seconds to prevent disk exhaustion."""
@@ -32,24 +37,23 @@ from app.plugins.base import BasePlugin
 logger = logging.getLogger(__name__)
 
 # ── CitationDetector singleton (CoW-safe, no network) ────────────
+# P-09: reuse shared singleton via factory — avoids double spaCy model load.
 _citation_detector = None
 try:
-    from app.antiplagio.citation.detector import CitationDetector, ZoneType
-    _citation_detector = CitationDetector()
-    logger.info("CitationDetector loaded for full_analysis")
+    from app.antiplagio.citation.detector import ZoneType, get_citation_detector
+    _citation_detector = get_citation_detector()
+    logger.info("CitationDetector singleton loaded (full_analysis)")
 except Exception as _exc:
     logger.warning("CitationDetector unavailable for full_analysis: %s", _exc)
 
 # ── Module-level engine loading (shared via CoW) ──────────────────
-_orchestrator = None
-_PluginConfig = None
 _available = False
 
 try:
-    from app.engine.plugin_orchestrator import PluginOrchestrator, PluginConfig
-
-    _PluginConfig = PluginConfig
-    _orchestrator = PluginOrchestrator(PluginConfig(
+    from app.engine.plugin_orchestrator import (
+        PluginConfig, initialize_orchestrator, get_orchestrator,
+    )
+    initialize_orchestrator(PluginConfig(
         enable_stylometric=True,
         enable_hallucination=True,
         enable_reasoning=True,
@@ -64,8 +68,9 @@ try:
         perplexity_tier2=os.getenv("PERPLEXITY_TIER2", "1") == "1",
     ))
     _available = True
+    _orch = get_orchestrator()
     logger.info("XplagiaX PluginOrchestrator loaded — plugins: %s",
-                ", ".join(_orchestrator.active_plugins()))
+                ", ".join(_orch.active_plugins()) if _orch else "none")
 except Exception as exc:
     logger.warning("XplagiaX engine not available: %s", exc)
 
@@ -83,7 +88,8 @@ class FullAnalysisPlugin(BasePlugin):
         )
 
     def analyze(self, text: str) -> Dict[str, Any]:
-        if not _available or _orchestrator is None:
+        orch = get_orchestrator()
+        if not _available or orch is None:
             return {
                 "error": "XplagiaX engine not loaded. Ensure ModernBERT "
                          "models are present and all dependencies installed.",
@@ -99,10 +105,7 @@ class FullAnalysisPlugin(BasePlugin):
                 ],
             }
 
-        # Run full pipeline
-        result = _orchestrator.run(text)
-
-        # Extract detection result
+        result = orch.run(text)
         det = result.get("detection_result")
         aa = result.get("additional_analyses", {})
         fr = result.get("forensic_report")
@@ -118,7 +121,6 @@ class FullAnalysisPlugin(BasePlugin):
             },
         }
 
-        # Add forensic report data
         if fr is not None:
             response["forensic"] = {
                 "report_id": fr.report_id,
@@ -135,20 +137,26 @@ class FullAnalysisPlugin(BasePlugin):
                 "executive_summary": fr.executive_summary,
                 "evidence_count": len(fr.evidence_points),
             }
-
-            # Generate HTML report to temp file and include path
             try:
-                _cleanup_old_reports("/tmp", prefix="forensic_", max_age_seconds=3600)
+                _cleanup_old_reports(_REPORT_DIR, prefix="forensic_", max_age_seconds=3600)
                 tmp = tempfile.NamedTemporaryFile(
                     suffix=".html", prefix="forensic_",
-                    dir="/tmp", delete=False,
+                    dir=_REPORT_DIR, delete=False,
                 )
-                _orchestrator._forensic_generator.export_html(fr, tmp.name)
-                response["forensic"]["html_report_path"] = tmp.name
+                tmp_name = tmp.name
+                tmp.close()
+                try:
+                    orch.export_html(fr, tmp_name)
+                    response["forensic"]["html_report_path"] = tmp_name
+                except Exception:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+                    raise
             except Exception as exc:
                 logger.warning("HTML report generation failed: %s", exc)
 
-        # Add plugin summaries
         if "perplexity" in aa:
             response["perplexity"] = {
                 "ai_score": aa["perplexity"].get("ai_score", 0),
@@ -175,7 +183,6 @@ class FullAnalysisPlugin(BasePlugin):
                 "total_references": rc.get("total_references", 0),
             }
 
-        # Zone classification (fast, no network)
         if _citation_detector is not None:
             try:
                 cit = _citation_detector.analyze(text)
@@ -201,7 +208,5 @@ class FullAnalysisPlugin(BasePlugin):
             except Exception as exc:
                 logger.warning("Zone analysis failed in full_analysis: %s", exc)
 
-        # Plain-text summary
-        response["summary"] = _orchestrator.summary(result)
-
+        response["summary"] = orch.summary(result)
         return response

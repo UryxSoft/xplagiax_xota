@@ -21,12 +21,16 @@ Files in this directory:
  
 import os
 import sys
- 
+
 # ── 1. Add engine dir to sys.path ─────────────────────────────
+# DT-08: Engine files use bare imports (e.g. `from stylometric_profiler import ...`)
+# because they were originally standalone inference scripts. This sys.path injection
+# is the intentional adapter that makes bare imports resolve correctly when the
+# engine package is imported as part of the Flask app. Do NOT change engine files
+# to `from app.engine.*` imports — that would break standalone inference usage.
 _ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _ENGINE_DIR not in sys.path:
     sys.path.insert(0, _ENGINE_DIR)
-    # Ensure it's also available via the package path
     if hasattr(sys.modules[__name__], '__path__'):
         pkg_path = sys.modules[__name__].__path__[0]
         if pkg_path not in sys.path:

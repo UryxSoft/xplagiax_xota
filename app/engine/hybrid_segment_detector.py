@@ -239,24 +239,19 @@ class ParagraphMapper:
         scores: List[ParagraphScore] = []
 
         for p_idx, (p_text, p_start, p_end) in enumerate(paragraphs):
-            overlapping_ai: List[float] = []
-            overlapping_human: List[float] = []
+            weighted_ai: List[float] = []
+            total_weight: float = 0.0
 
             for wr in window_results:
                 overlap_start = max(wr.start_word, p_start)
                 overlap_end = min(wr.end_word, p_end)
                 if overlap_end > overlap_start:
-                    overlap_words = overlap_end - overlap_start
-                    para_words = max(p_end - p_start, 1)
-                    weight = overlap_words / para_words
-                    overlapping_ai.append(wr.ai_pct * weight)
-                    overlapping_human.append(wr.human_pct * weight)
+                    weight = (overlap_end - overlap_start) / max(p_end - p_start, 1)
+                    weighted_ai.append(wr.ai_pct * weight)
+                    total_weight += weight
 
-            if overlapping_ai:
-                total_ai = sum(overlapping_ai)
-                total_human = sum(overlapping_human)
-                denom = total_ai + total_human
-                ai_avg = (total_ai / denom * 100) if denom > 0 else 50.0
+            if total_weight > 0:
+                ai_avg = sum(weighted_ai) / total_weight
                 human_avg = 100.0 - ai_avg
             else:
                 ai_avg = 50.0
@@ -273,7 +268,7 @@ class ParagraphMapper:
                 start_word=p_start, end_word=p_end,
                 word_count=p_end - p_start,
                 ai_score=round(ai_avg, 2), human_score=round(human_avg, 2),
-                zone=zone, contributing_windows=len(overlapping_ai),
+                zone=zone, contributing_windows=len(weighted_ai),
             ))
 
         return scores
@@ -462,6 +457,20 @@ class HybridSegmentAnalyzer:
         words = body_text.split()
         total_words = len(words)
 
+        # EC-02: explicit minimum word count guard — build_windows() returns [] below
+        # MIN_WINDOW_WORDS anyway; early return makes the edge case visible.
+        if total_words < MIN_WINDOW_WORDS:
+            return HybridAnalysisResult(
+                paragraph_scores=[], window_results=[], breakpoints=[],
+                global_ai_score=0.0, classification="INCONCLUSIVE",
+                risk_level="LOW",
+                interpretation=(
+                    f"Text too short for segment analysis: {total_words} words "
+                    f"(minimum {MIN_WINDOW_WORDS} required)."
+                ),
+                feature_vector=_build_feature_vector([], []),
+            )
+
         logger.info("HybridSegment: %d words, %d paragraphs",
                      total_words, len(paragraphs))
 
@@ -478,13 +487,7 @@ class HybridSegmentAnalyzer:
         )
 
         feature_vector = _build_feature_vector(paragraph_scores, breakpoints)
-
-        if total_words > 0:
-            global_ai = sum(
-                p.ai_score * p.word_count for p in paragraph_scores
-            ) / total_words
-        else:
-            global_ai = 0.0
+        global_ai = feature_vector["global_ai_score"]
 
         result = HybridAnalysisResult(
             paragraph_scores=paragraph_scores,

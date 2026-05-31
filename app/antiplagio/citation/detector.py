@@ -459,6 +459,10 @@ class CitationDetector:
 
         return entries
 
+    def parse_bibliography(self, bib_text: str) -> list:
+        """Public wrapper for _parse_bibliography."""
+        return self._parse_bibliography(bib_text)
+
     def _split_bibliography_entries(self, bib_text: str) -> list:
         """Splits bibliography block into individual entries."""
         lines = bib_text.split('\n')
@@ -661,8 +665,11 @@ class CitationDetector:
                 _mark_zone(citation, found)
                 linked_bib_keys.add(found.key)
 
-            # IEEE/Chicago without bibliography → citation alone is sufficient
-            if not matched and citation.style in (CitationStyle.IEEE, CitationStyle.CHICAGO):
+            # EC-05: IEEE/Vancouver/Chicago without bibliography → inline citation
+            # is self-contained (numbered reference system, no entry needed).
+            if not matched and citation.style in (
+                CitationStyle.IEEE, CitationStyle.CHICAGO, CitationStyle.VANCOUVER
+            ):
                 idx = bisect.bisect_right(_zone_starts, citation.start_pos) - 1
                 if idx >= 0:
                     zone = zones[idx]
@@ -721,3 +728,16 @@ class CitationDetector:
         if not styles:
             return 0.0
         return Counter(styles).most_common(1)[0][1] / len(styles)
+
+
+# ── Module-level singleton (P-09) ─────────────────────────────────
+# Both flask_routes and full_analysis import this factory so the spaCy
+# model is loaded exactly once at gunicorn preload, shared via CoW.
+_shared_detector: Optional[CitationDetector] = None
+
+
+def get_citation_detector() -> CitationDetector:
+    global _shared_detector
+    if _shared_detector is None:
+        _shared_detector = CitationDetector()
+    return _shared_detector

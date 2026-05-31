@@ -53,7 +53,7 @@ class AIDetectionPlugin(BasePlugin):
             "human_percentage": human_pct,
             "ai_percentage": ai_pct,
             "detected_model": summary.get("detected_model"),
-            "uncertainty_zone": False,
+            "uncertainty_zone": abs(ai_pct - human_pct) < 15,
             "raw_scores": {
                 "human": human_pct,
                 "ai": ai_pct,

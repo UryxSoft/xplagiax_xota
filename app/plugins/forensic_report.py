@@ -42,28 +42,42 @@ class ForensicReportPlugin(BasePlugin):
         if not _available:
             return {"error": "ForensicReportGenerator not loaded."}
 
-        # Use full_analysis plugin's orchestrator if available
         try:
-            from app.plugins.full_analysis import _orchestrator, _available as fa_avail
-            if fa_avail and _orchestrator is not None:
-                result = _orchestrator.run(text)
-                fr = result.get("forensic_report")
-                if fr:
-                    tmp = tempfile.NamedTemporaryFile(
-                        suffix=".html", prefix="forensic_",
-                        dir="/tmp", delete=False,
-                    )
-                    _orchestrator._forensic_generator.export_html(fr, tmp.name)
+            from app.engine.plugin_orchestrator import get_orchestrator
+            from app.plugins.full_analysis import _cleanup_old_reports, _REPORT_DIR
 
-                    return {
-                        "report_id": fr.report_id,
-                        "verdict": fr.verdict,
-                        "confidence": fr.confidence,
-                        "html_path": tmp.name,
-                        "word_count": fr.word_count,
-                        "evidence_count": len(fr.evidence_points),
-                    }
+            orch = get_orchestrator()
+            if orch is None:
+                return {"error": "Full pipeline required for report generation."}
+
+            result = orch.run(text)
+            fr = result.get("forensic_report")
+            if fr:
+                _cleanup_old_reports(_REPORT_DIR, prefix="forensic_", max_age_seconds=3600)
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=".html", prefix="forensic_",
+                    dir=_REPORT_DIR, delete=False,
+                )
+                tmp_name = tmp.name
+                tmp.close()
+                try:
+                    orch.export_html(fr, tmp_name)
+                except Exception:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+                    raise
+
+                return {
+                    "report_id": fr.report_id,
+                    "verdict": fr.verdict,
+                    "confidence": fr.confidence,
+                    "html_path": tmp_name,
+                    "word_count": fr.word_count,
+                    "evidence_count": len(fr.evidence_points),
+                }
         except Exception as exc:
-            logger.warning("Full pipeline failed, using standalone: %s", exc)
+            logger.warning("Full pipeline failed, no report generated: %s", exc)
 
         return {"error": "Full pipeline required for report generation."}

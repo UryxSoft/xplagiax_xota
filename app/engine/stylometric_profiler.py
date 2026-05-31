@@ -187,6 +187,7 @@ _STOP_WORDS: frozenset = FUNCTION_WORDS | frozenset(
 
 _ABBREV_SENTINEL = "\x02"   # single control char — not present in normal text
 _DECIMAL_SENTINEL = "\x03"
+_ACRONYM_SENTINEL = "\x04"  # EC-01: protects ALL-CAPS acronyms (NASA., CIA., EU.)
 
 _ABBREV_PATTERN = re.compile(
     r"\b(Mr|Mrs|Ms|Dr|Prof|St|Jr|Sr|vs|etc|al|Fig|eq|Vol|No|pp)\."
@@ -194,6 +195,9 @@ _ABBREV_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DECIMAL_PATTERN = re.compile(r"(\d)\.(\d)")
+# 2+ uppercase letters before a period — almost never a sentence boundary.
+# Handles 100%-uppercase text where _ABBREV_PATTERN's title-case assumptions break.
+_ACRONYM_PATTERN = re.compile(r"\b([A-Z]{2,})\.")
 _SENT_SPLIT_RE = re.compile(r"[.!?]+(?=\s|$)")
 
 
@@ -204,18 +208,26 @@ def _split_sentences(text: str) -> List[str]:
     Improvements over the naive re.split(r'[.!?]+', text):
       - Decimal numbers (3.14, 99.5%) are not split mid-number.
       - Common abbreviations (Dr., Mr., Prof., etc.) are not split.
+      - ALL-CAPS acronyms (NASA., CIA., EU.) are not split (EC-01).
       - Only splits when punctuation is followed by whitespace or end-of-string,
         preventing splits inside URLs and compound words.
     """
+    # Protect ALL-CAPS acronyms first so they survive the ABBREV and DECIMAL passes
+    protected = _ACRONYM_PATTERN.sub(
+        lambda m: m.group().replace(".", _ACRONYM_SENTINEL), text
+    )
     protected = _ABBREV_PATTERN.sub(
-        lambda m: m.group().replace(".", _ABBREV_SENTINEL), text
+        lambda m: m.group().replace(".", _ABBREV_SENTINEL), protected
     )
     protected = _DECIMAL_PATTERN.sub(
         lambda m: m.group().replace(".", _DECIMAL_SENTINEL), protected
     )
     parts = _SENT_SPLIT_RE.split(protected)
     return [
-        p.replace(_ABBREV_SENTINEL, ".").replace(_DECIMAL_SENTINEL, ".").strip()
+        p.replace(_ABBREV_SENTINEL, ".")
+         .replace(_DECIMAL_SENTINEL, ".")
+         .replace(_ACRONYM_SENTINEL, ".")
+         .strip()
         for p in parts
         if p.strip()
     ]

@@ -254,6 +254,10 @@ class ReasoningRiskClassifier:
     }
     _INVERSE_WEIGHT = 0.08
 
+    # EC-04 / 4.2-Bias-2: causal/consequence/contrast/sequence thresholds raised to
+    # reduce false positives on formal academic text, which is inherently dense in
+    # logical connectors. backtracking + cot_scaffold thresholds are unchanged —
+    # those markers are unique to reasoning models, not academic prose.
     _THR = {
         "type_token_ratio":         (0.35, 0.72),
         "mean_sentence_length":     (12.0, 26.0),
@@ -261,12 +265,12 @@ class ReasoningRiskClassifier:
         "mean_word_length":         (3.8,  5.8),
         "punctuation_ratio":        (0.02, 0.06),
         "stopword_ratio":           (0.30, 0.52),
-        "consequence_density":      (0.02, 0.06),
-        "causal_density":           (0.02, 0.07),
-        "contrast_density":         (0.02, 0.06),
-        "sequence_density":         (0.01, 0.05),
-        "backtracking_density":     (0.01, 0.07),
-        "cot_scaffold_density":     (0.02, 0.10),
+        "consequence_density":      (0.03, 0.10),  # was (0.02, 0.06)
+        "causal_density":           (0.03, 0.12),  # was (0.02, 0.07)
+        "contrast_density":         (0.03, 0.09),  # was (0.02, 0.06)
+        "sequence_density":         (0.02, 0.09),  # was (0.01, 0.05)
+        "backtracking_density":     (0.01, 0.07),  # unchanged — reasoning-model unique
+        "cot_scaffold_density":     (0.02, 0.10),  # unchanged — reasoning-model unique
         "intuition_leap_density":   (0.01, 0.04),
         "paragraph_length_cv":      (0.18, 0.55),
         "word_entropy_normalised":  (0.68, 0.90),

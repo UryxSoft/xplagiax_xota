@@ -19,7 +19,7 @@ import logging
 import os
 import pkgutil
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,9 @@ class PluginRegistry:
         if not valid:
             return results
 
-        max_workers = min(len(valid), 4)
+        # P-03: cap raised to 8 — ML plugins release GIL during C-level inference,
+        # so additional threads genuinely run in parallel on multi-core machines.
+        max_workers = min(len(valid), 8)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all plugins at once so they run in parallel
             future_to_meta: Dict[Any, tuple] = {}
@@ -86,12 +88,12 @@ class PluginRegistry:
                 t0 = time.perf_counter()
                 future_to_meta[executor.submit(plugin.analyze, text)] = (pname, t0)
 
-            # Collect with a shared deadline so every plugin gets the full budget
-            deadline = time.perf_counter() + timeout
+            # P-07: per-plugin individual timeout — each plugin gets its full budget.
+            # A shared deadline would let a slow plugin (e.g. watermark ~15s) starve
+            # fast ones that are checked later in iteration order.
             for future, (pname, t0) in future_to_meta.items():
-                remaining = max(0.0, deadline - time.perf_counter())
                 try:
-                    result = future.result(timeout=remaining)
+                    result = future.result(timeout=timeout)
                     elapsed = time.perf_counter() - t0
                     results[pname] = {
                         "status": "ok",
@@ -116,6 +118,61 @@ class PluginRegistry:
                     }
 
         return results
+
+    def run_stream(self, plugin_names: List[str], text: str, timeout: int = 30):
+        """
+        Yield (plugin_name, result_dict) as each plugin completes.
+        Used by /analyze_stream (SSE) to deliver results incrementally.
+        """
+        # Yield errors for unknown plugins immediately
+        valid: List[tuple] = []
+        for pname in plugin_names:
+            plugin = self.get(pname)
+            if plugin is None:
+                yield pname, {
+                    "status": "error",
+                    "error": f"Plugin '{pname}' not found",
+                    "available": self.list_plugins(),
+                }
+            else:
+                valid.append((pname, plugin))
+
+        if not valid:
+            return
+
+        max_workers = min(len(valid), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_meta: Dict[Any, tuple] = {}
+            for pname, plugin in valid:
+                t0 = time.perf_counter()
+                future_to_meta[executor.submit(plugin.analyze, text)] = (pname, t0)
+
+            try:
+                for future in as_completed(future_to_meta, timeout=timeout):
+                    pname, t0 = future_to_meta[future]
+                    elapsed = time.perf_counter() - t0
+                    try:
+                        result = future.result()
+                        yield pname, {
+                            "status": "ok",
+                            "data": result,
+                            "elapsed_ms": round(elapsed * 1000, 1),
+                        }
+                    except Exception as exc:
+                        logger.error("Plugin '%s' failed: %s", pname, exc, exc_info=True)
+                        yield pname, {
+                            "status": "error",
+                            "error": str(exc),
+                            "elapsed_ms": round(elapsed * 1000, 1),
+                        }
+            except FuturesTimeoutError:
+                for future, (pname, t0) in future_to_meta.items():
+                    if not future.done():
+                        logger.error("Plugin '%s' timed out after %ds", pname, timeout)
+                        yield pname, {
+                            "status": "error",
+                            "error": f"Plugin timed out after {timeout}s",
+                        }
 
     def discover(self) -> None:
         """

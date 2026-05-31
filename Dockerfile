@@ -30,9 +30,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 
 # ── Resolve Dependency Conflicts ─────────────────────────────────────────────
-# Remove the macOS-specific pins from requirements.txt so they don't 
-# conflict with the optimized Linux versions we install below.
-RUN sed -i '/torch/d; /numpy/d; /transformers/d; /spacy/d' requirements.txt
+# S-11: Only remove the macOS-specific torch pin (torch>=2.2.2,<2.3).
+# All other package version constraints (numpy, transformers, spacy, etc.)
+# are preserved for reproducible builds — the broad sed was erasing them.
+RUN sed -i '/^torch/d' requirements.txt
 
 RUN pip install --user --no-cache-dir --prefer-binary \
     "torch>=2.4.0" \

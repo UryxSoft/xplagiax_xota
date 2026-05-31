@@ -16,14 +16,15 @@ from flask import Blueprint, request, jsonify, current_app
 
 import logging
 
-from .citation.detector import CitationDetector, CitationStyle, ZoneType
+from app import limiter
+from .citation.detector import ZoneType, get_citation_detector
 from .citation.validator import CitationValidator, ValidationStatus, _shared_cache
 
 logger = logging.getLogger(__name__)
 
-# Module-level singleton — instantiated once at gunicorn preload, shared via CoW.
-# Avoids spaCy model reload (~200-500 ms) on every request.
-_citation_detector = CitationDetector()
+# Module-level singleton via factory — shared with full_analysis to avoid
+# loading the spaCy model twice at gunicorn preload (P-09).
+_citation_detector = get_citation_detector()
 
 antiplagio_bp = Blueprint("antiplagio", __name__, url_prefix="/api/v2")
 
@@ -36,13 +37,7 @@ def async_route(f):
     """Decorator to use async handlers in Flask (sync workers, no gevent)."""
     @wraps(f)
     def wrapper(*args, **kwargs):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(f(*args, **kwargs))
-        finally:
-            loop.close()
-            asyncio.set_event_loop(None)
+        return asyncio.run(f(*args, **kwargs))
     return wrapper
 
 
@@ -51,6 +46,7 @@ def async_route(f):
 # ─────────────────────────────────────────────
 
 @antiplagio_bp.route("/citations/detect", methods=["POST"])
+@limiter.limit("60/minute")
 def detect_citations():
     """
     Citation detection only (no plagiarism scoring, no external API calls).
@@ -114,6 +110,7 @@ def detect_citations():
 
 
 @antiplagio_bp.route("/citations/validate", methods=["POST"])
+@limiter.limit("10/minute")
 @async_route
 async def validate_citations():
     """
@@ -131,7 +128,7 @@ async def validate_citations():
         bibliography = analysis.bibliography
     elif "bibliography" in data:
         raw_text = "Referencias\n" + "\n".join(data["bibliography"])
-        bibliography = _citation_detector._parse_bibliography(raw_text)
+        bibliography = _citation_detector.parse_bibliography(raw_text)
     else:
         return jsonify({"error": "Se requiere 'text' o 'bibliography'"}), 400
 

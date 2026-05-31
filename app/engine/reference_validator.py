@@ -33,14 +33,11 @@ from __future__ import annotations
 
 import json
 import logging
-import math
-import os
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -89,6 +86,13 @@ _CROSSREF_API    = "https://api.crossref.org/works"
 _OPENALEX_API    = "https://api.openalex.org/works"
 _S2_API          = "https://api.semanticscholar.org/graph/v1/paper/search"
 
+# S-06: SSRF allowlist — only these hosts may be contacted by the API client.
+_ALLOWED_API_HOSTS: frozenset = frozenset({
+    "api.crossref.org",
+    "api.openalex.org",
+    "api.semanticscholar.org",
+})
+
 _RATE_LIMIT_MS   = 800    # 800ms between API calls (CheckIfExist spec)
 _MAX_CANDIDATES  = 3      # Top N candidates from each API
 _REQUEST_TIMEOUT = 10     # seconds
@@ -114,6 +118,49 @@ _MAX_REFS_TO_VALIDATE = 20
 
 # User-Agent for API requests (polite crawling)
 _USER_AGENT = "XplagiaX-ReferenceValidator/1.0 (mailto:research@xplagiax.com)"
+
+# DT-14: Simple circuit breaker for external APIs (CrossRef, S2, OpenAlex).
+# Opens after _CB_FAILURE_THRESHOLD consecutive failures; half-opens after
+# _CB_RESET_SECONDS to allow one probe request.
+_CB_FAILURE_THRESHOLD: int   = 5
+_CB_RESET_SECONDS:     float = 60.0
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """S-06: Block HTTP redirects to prevent SSRF via open-redirect chains."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "Redirect blocked (SSRF guard)", headers, fp)
+
+
+_no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
+
+
+class _CircuitBreaker:
+    """Per-host failure counter with automatic half-open reset."""
+
+    __slots__ = ("_failures", "_open_since")
+
+    def __init__(self) -> None:
+        self._failures: int = 0
+        self._open_since: float = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        if self._failures >= _CB_FAILURE_THRESHOLD:
+            if time.time() - self._open_since >= _CB_RESET_SECONDS:
+                self._failures = 0  # half-open: allow one probe
+                return False
+            return True
+        return False
+
+    def record_success(self) -> None:
+        self._failures = 0
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._failures == _CB_FAILURE_THRESHOLD:
+            self._open_since = time.time()
 
 
 # ============================================================================
@@ -507,6 +554,7 @@ class _APIClient:
         self._rate_limit = rate_limit_ms / 1000.0
         self._timeout = timeout
         self._last_request_time = 0.0
+        self._cb = _CircuitBreaker()  # DT-14: circuit breaker per client instance
 
     def _throttle(self) -> None:
         """Enforce rate limiting between API calls."""
@@ -517,16 +565,27 @@ class _APIClient:
 
     def _get_json(self, url: str) -> Optional[dict]:
         """GET request returning parsed JSON, or None on failure."""
+        # S-06: SSRF guard — reject any URL not targeting an allowed academic API host
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https" or parsed.netloc not in _ALLOWED_API_HOSTS:
+            logger.warning("SSRF guard blocked request to: %s", parsed.netloc)
+            return None
+        if self._cb.is_open:
+            logger.debug("Circuit breaker open — skipping API call: %s", url[:80])
+            return None
         self._throttle()
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": _USER_AGENT,
                 "Accept": "application/json",
             })
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            with _no_redirect_opener.open(req, timeout=self._timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            self._cb.record_success()
+            return data
         except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
                 TimeoutError, OSError) as exc:
+            self._cb.record_failure()
             logger.debug("API request failed: %s → %s", url[:100], exc)
             return None
 

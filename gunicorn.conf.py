@@ -55,34 +55,29 @@ limit_request_fields = 100
 limit_request_field_size = 8190
 
 _celery_process = None
-# ── Hooks ─────────────────────────────────────────────────────────
-def when_ready(server):
-    """
-    Se ejecuta DESPUÉS de preload_app. Los modelos ya están en memoria.
-    Forkeamos el worker de Celery aquí para que herede las páginas via CoW.
-    subprocess.Popen NO funciona para esto (hace exec y pierde la memoria).
-    multiprocessing.Process usa os.fork() — el hijo hereda las páginas físicas.
-    """
+
+
+# ── Celery bootstrap (B-10: shared by when_ready and child_exit) ──
+def _run_celery():
+    """Celery worker entrypoint — runs inside a forked child process."""
+    from celery.__main__ import main as celery_main
+    sys.argv = [
+        "celery",
+        "-A", "app.celery_app.celery",
+        "worker",
+        "--loglevel=info",
+        "--pool=solo",
+        "--concurrency=1",
+        "--without-heartbeat",
+        "--without-gossip",
+        "--without-mingle",
+    ]
+    celery_main()
+
+
+def _spawn_celery_worker(server):
+    """Fork a Celery worker from the gunicorn master and update _celery_process."""
     global _celery_process
-
-    def _run_celery():
-        # Este código corre en el proceso hijo forkeado.
-        # sys.modules ya tiene todos los imports del padre, incluidos los modelos.
-        # Celery no los recarga — los encuentra en sys.modules directamente.
-        from celery.__main__ import main as celery_main
-        sys.argv = [
-            "celery",
-            "-A", "app.celery_app.celery",
-            "worker",
-            "--loglevel=info",
-            "--pool=solo",
-            "--concurrency=1",
-            "--without-heartbeat",
-            "--without-gossip",
-            "--without-mingle",
-        ]
-        celery_main()
-
     _celery_process = multiprocessing.Process(
         target=_run_celery,
         name="celery-worker",
@@ -93,6 +88,25 @@ def when_ready(server):
         "Celery worker forkeado del master (CoW activo): PID %s",
         _celery_process.pid,
     )
+
+
+# ── Hooks ─────────────────────────────────────────────────────────
+def when_ready(server):
+    """
+    Se ejecuta DESPUÉS de preload_app. Los modelos ya están en memoria.
+    Forkeamos el worker de Celery aquí para que herede las páginas via CoW.
+    subprocess.Popen NO funciona para esto (hace exec y pierde la memoria).
+    multiprocessing.Process usa os.fork() — el hijo hereda las páginas físicas.
+
+    Set GUNICORN_SPAWN_CELERY=1 to enable. Default is 0 — use the
+    docker-compose celery_worker service instead to avoid duplicate workers.
+    """
+    if os.getenv("GUNICORN_SPAWN_CELERY", "0") != "1":
+        server.log.info(
+            "GUNICORN_SPAWN_CELERY not set — Celery worker managed externally"
+        )
+        return
+    _spawn_celery_worker(server)
 
 
 def on_exit(server):
@@ -114,22 +128,7 @@ def child_exit(server, worker):
             "Celery worker (PID %s) murió — reiniciando...",
             _celery_process.pid,
         )
-        # Re-use the same _run_celery bootstrap from when_ready
-        def _run_celery():
-            from celery.__main__ import main as celery_main
-            import sys
-            sys.argv = [
-                "celery", "-A", "app.celery_app.celery", "worker",
-                "--loglevel=info", "--pool=solo", "--concurrency=1",
-                "--without-heartbeat", "--without-gossip", "--without-mingle",
-            ]
-            celery_main()
-
-        _celery_process = multiprocessing.Process(
-            target=_run_celery, name="celery-worker", daemon=True
-        )
-        _celery_process.start()
-        server.log.info("Celery worker reiniciado — nuevo PID %s", _celery_process.pid)
+        _spawn_celery_worker(server)
 
 def post_fork(server, worker):
     """Called just after a worker has been forked."""

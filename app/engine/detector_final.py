@@ -598,6 +598,20 @@ def analyze_long_documentsd_(long_text: str, max_tokens: int = 512) -> dict:
     return results
 
 
+# ── Embedding / inference result cache ───────────────────────────────────────
+# Keyed by sha256(text). Prevents re-running the 3-model ensemble when the
+# same text is analyzed by multiple plugins in the same request (e.g. both
+# ai_detection and full_analysis requested together) or repeated shortly after.
+import hashlib as _hashlib
+import threading as _threading
+import time as _time
+
+_FAST_CACHE: dict = {}
+_FAST_CACHE_LOCK = _threading.Lock()
+_FAST_CACHE_TTL: float = 300.0   # 5 minutes — covers same-request multi-plugin calls
+_FAST_CACHE_MAX: int = 20        # keep memory bounded; LRU eviction
+
+
 @torch.inference_mode()
 def analyze_fast(text: str) -> dict:
     """
@@ -613,6 +627,7 @@ def analyze_fast(text: str) -> dict:
            >= 6000 words → 1024 tokens (minimal batches, no timeout)
       3. BATCH_SIZE=12 — more sequences per forward pass, fewer model calls.
       4. Token-boundary splitting — cleaner chunks, no paragraph fragmentation.
+      5. Result cache (TTL=5min) — multi-plugin requests skip repeated inference.
 
     Expected CPU time (3-model ensemble, ~2.5s per batch call):
         500 w →  ~2.5s   1000 w →  ~2.5s   2000 w →  ~2.5s
@@ -620,6 +635,17 @@ def analyze_fast(text: str) -> dict:
     """
     if not text.strip():
         return {"error": "El documento está vacío."}
+
+    # Cache check — avoids re-running the ensemble for the same text
+    _text_hash = _hashlib.sha256(text.encode()).hexdigest()
+    _now = _time.monotonic()
+    with _FAST_CACHE_LOCK:
+        _entry = _FAST_CACHE.get(_text_hash)
+        if _entry is not None and _now - _entry[1] < _FAST_CACHE_TTL:
+            return _entry[0]
+        if len(_FAST_CACHE) >= _FAST_CACHE_MAX:
+            _oldest = min(_FAST_CACHE, key=lambda k: _FAST_CACHE[k][1])
+            del _FAST_CACHE[_oldest]
 
     # Adaptive chunk size
     word_count = len(text.split())
@@ -689,7 +715,7 @@ def analyze_fast(text: str) -> dict:
     overall_ai = round(total_ai_w / total_len)
     overall_detected = max(detected_model_votes, key=detected_model_votes.get) if detected_model_votes else None
 
-    return {
+    _result = {
         "overall_summary": {
             "total_human_percentage": overall_human,
             "total_ai_percentage": overall_ai,
@@ -698,3 +724,6 @@ def analyze_fast(text: str) -> dict:
         },
         "segments": segments,
     }
+    with _FAST_CACHE_LOCK:
+        _FAST_CACHE[_text_hash] = (_result, _time.monotonic())
+    return _result

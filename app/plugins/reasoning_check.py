@@ -44,9 +44,4 @@ class ReasoningCheckPlugin(BasePlugin):
 
         vec = _profiler.vectorize(text)
         feat_names = _profiler.feature_names()
-
-        if _classifier:
-            return _classifier.classify(vec, feat_names)
-
-        # Fallback to raw features
-        return dict(zip(feat_names, vec.tolist()))
+        return _classifier.classify(vec, feat_names)

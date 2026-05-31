@@ -42,12 +42,9 @@ class HallucinationCheckPlugin(BasePlugin):
             return {"error": "HallucinationProfiler not loaded."}
 
         stats = _profiler.compute_stats(text)
-        if _classifier:
-            analysis = _classifier.classify(stats)
-            analysis["feature_values"] = {
-                k: stats[k] for k in stats
-                if isinstance(stats[k], (int, float))
-            }
-            return analysis
-
-        return stats
+        analysis = _classifier.classify(stats)
+        analysis["feature_values"] = {
+            k: v for k, v in stats.items()
+            if isinstance(v, (int, float))
+        }
+        return analysis
