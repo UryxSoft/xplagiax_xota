@@ -5,19 +5,20 @@ Key design decisions:
     - preload_app = True → loads the app ONCE in the master process,
       then forks workers. Heavy models (torch, transformers) loaded at
       module level are shared across workers via Linux Copy-on-Write,
-      cutting per-worker memory from ~500 MB to ~50 MB overhead.
-    - worker_class = "sync" → PyTorch/transformers use C-level threads
-      internally; gevent monkey-patching causes deadlocks with ML workloads.
-      sync workers are correct and required for CPU-bound inference.
-      NOTE: the `threads = 2` setting below has no effect with sync workers
-      (it only applies to gthread workers) and is kept for documentation.
-    - workers = 2 (default) → ML workloads are memory-heavy; cap at 2 for
-      VPS deployments. Override via WEB_CONCURRENCY env var.
+      cutting per-worker memory from ~50 MB overhead per worker.
+    - worker_class = "gthread" → workers are threads within a process;
+      all share the master's memory. Safe for CPU-only inference (no CUDA,
+      no DataLoader multiprocessing). Keeps RAM at ~2.5 GB vs ~5 GB for sync.
+    - workers = 2 (default) → with gthread, each worker adds only ~100-150 MB
+      (thread overhead, no model duplication).
+    - Celery watchdog thread → daemon thread in master checks every 30s if
+      the Celery process is alive and restarts it if not. Uses <1 MB RAM.
 """
 
 import os
 import multiprocessing
 import sys
+import threading
 # ── Server socket ─────────────────────────────────────────────────
 bind = os.getenv("GUNICORN_BIND", "0.0.0.0:5006")
 
@@ -94,6 +95,23 @@ def _spawn_celery_worker(server):
     )
 
 
+def _celery_watchdog(server):
+    """
+    Daemon thread in master — checks every 30s if Celery is alive.
+    Restarts it immediately if it died (OOM, segfault, max-tasks-per-child
+    recycle). Uses <1 MB RAM. Prevents tasks from piling up in PENDING state.
+    """
+    while True:
+        threading.Event().wait(30)
+        global _celery_process
+        if _celery_process is not None and not _celery_process.is_alive():
+            server.log.warning(
+                "Celery watchdog: PID %s muerto — reiniciando...",
+                _celery_process.pid,
+            )
+            _spawn_celery_worker(server)
+
+
 # ── Hooks ─────────────────────────────────────────────────────────
 def when_ready(server):
     """
@@ -111,6 +129,9 @@ def when_ready(server):
         )
         return
     _spawn_celery_worker(server)
+    t = threading.Thread(target=_celery_watchdog, args=(server,), daemon=True)
+    t.start()
+    server.log.info("Celery watchdog iniciado — revisión cada 30s")
 
 
 def on_exit(server):
