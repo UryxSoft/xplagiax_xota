@@ -11,18 +11,29 @@ from flask_compress import Compress
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+from app.config import redis_url
+
 cache = Cache()
 compress = Compress()
 
 # DT-05: Rate limiter — uses Redis when REDIS_URL is set, memory otherwise.
 # memory:// is per-process (not shared across workers) — acceptable for dev;
 # production should set REDIS_URL so limits are enforced cluster-wide.
+#
+# Fix #2: redis_url() injects REDIS_PASSWORD, and swallow_errors=True means a
+# Redis hiccup degrades the limiter gracefully instead of hanging or 500-ing
+# every request — including the "instant" /analyze_document_async enqueue.
 limiter = Limiter(
     key_func=get_remote_address,
-    storage_uri=os.environ.get("REDIS_URL", "memory://"),
-    storage_options={"max_connections": int(os.environ.get("REDIS_MAX_CONNECTIONS", "10"))},
+    storage_uri=redis_url() if os.environ.get("REDIS_URL") else "memory://",
+    storage_options={
+        "max_connections": int(os.environ.get("REDIS_MAX_CONNECTIONS", "10")),
+        "socket_connect_timeout": 5,
+        "socket_timeout": 5,
+    },
     default_limits=["500/hour"],
     strategy="fixed-window",
+    swallow_errors=True,
 )
 
 

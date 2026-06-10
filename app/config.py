@@ -9,6 +9,25 @@ import os
 import secrets
 
 
+def redis_url() -> str:
+    """
+    REDIS_URL with REDIS_PASSWORD injected when set (Fix #2).
+
+    The docker-compose redis service may run with --requirepass $REDIS_PASSWORD,
+    but REDIS_URL defaults to `redis://redis:6379` with no credentials. Every
+    Redis call (Celery broker enqueue, rate-limiter, cache) would then fail with
+    NOAUTH and retry/hang — making the "instant" async endpoint block. This
+    builds an authenticated URL so producer and limiter connect cleanly.
+    """
+    url = os.environ.get("REDIS_URL", "redis://redis:6379")
+    password = os.environ.get("REDIS_PASSWORD", "")
+    # Only inject if a password exists and the URL has no credentials yet.
+    if password and "@" not in url.split("//", 1)[-1]:
+        scheme, sep, rest = url.partition("//")
+        url = f"{scheme}{sep}:{password}@{rest}"
+    return url
+
+
 def _require_secret_key() -> str:
     """Return SECRET_KEY from env, generating a secure fallback for local dev only."""
     key = os.environ.get("SECRET_KEY", "")
@@ -35,7 +54,7 @@ class Config:
     # RedisCache is shared across all gunicorn workers; SimpleCache is per-process
     # and misses 50%+ of requests in multi-worker deployments.
     CACHE_TYPE = "RedisCache" if os.environ.get("REDIS_URL") else "SimpleCache"
-    CACHE_REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
+    CACHE_REDIS_URL = redis_url()
     CACHE_DEFAULT_TIMEOUT = 300
     # Explicit pool cap — prevents runaway connections under burst traffic.
     REDIS_MAX_CONNECTIONS = int(os.environ.get("REDIS_MAX_CONNECTIONS", "10"))
@@ -46,7 +65,9 @@ class Config:
     COMPRESS_MIN_SIZE = 256
 
     # ── Celery (optional, for heavy async plugins) ─────────────────
-    REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
+    # redis_url() injects REDIS_PASSWORD so the broker enqueue authenticates
+    # instead of hanging on NOAUTH (Fix #2/#3).
+    REDIS_URL = redis_url()
     CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", f"{REDIS_URL}/0")
     CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", f"{REDIS_URL}/1")
 

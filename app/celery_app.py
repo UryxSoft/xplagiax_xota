@@ -27,7 +27,25 @@ def make_celery():
     # Re-queue unacknowledged tasks after 360s (slightly > time_limit=300).
     # Default is 3600s (1 hour) — tasks from a dead worker would stay
     # PENDING for up to 1 hour before being retried.
-    celery.conf.broker_transport_options = {'visibility_timeout': 360}
+    #
+    # Fix #3: socket timeouts so a slow/dead Redis broker fails fast instead of
+    # hanging the web request that calls .delay() (the "instant" async endpoint).
+    celery.conf.broker_transport_options = {
+        'visibility_timeout': 360,
+        'socket_timeout': 5,
+        'socket_connect_timeout': 5,
+    }
+    # Retry the broker connection on worker startup (Redis may boot after web).
+    celery.conf.broker_connection_retry_on_startup = True
+    # Producer-side (.delay()) publish: bound the retry so an unreachable broker
+    # raises in ~1s instead of blocking the HTTP handler for the default ~20s+.
+    celery.conf.broker_connection_timeout = 5
+    celery.conf.task_publish_retry_policy = {
+        'max_retries': 3,
+        'interval_start': 0,
+        'interval_step': 0.2,
+        'interval_max': 0.5,
+    }
 
     # TaskBase override to ensure Flask context is active during task execution
     class ContextTask(celery.Task):

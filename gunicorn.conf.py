@@ -28,7 +28,12 @@ bind = os.getenv("GUNICORN_BIND", "0.0.0.0:5006")
 workers = int(os.getenv("WEB_CONCURRENCY",
                         min(multiprocessing.cpu_count(), 2)))
 worker_class = "gthread"
-threads = 2
+# Fix #6: more threads per worker. The async enqueue (/analyze_document_async)
+# and status polling (/analyze_status) are I/O-bound on Redis — extra threads
+# keep them responsive even while the heavy *synchronous* endpoints
+# (/analyze_document, /analyze_stream) occupy threads. Threads share the CoW
+# model memory, so the RAM cost is only ~1 stack each. Override via GUNICORN_THREADS.
+threads = int(os.getenv("GUNICORN_THREADS", "4"))
 
 # ── CRITICAL: Enable preload for CoW memory sharing ──────────────
 preload_app = True

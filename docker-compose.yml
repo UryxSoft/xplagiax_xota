@@ -40,10 +40,19 @@ services:
       - "5006:5006"
     environment:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # S-09: must match the password set on the redis service so the URL can
+      # authenticate (config.py injects it into REDIS_URL automatically).
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       # Fork Celery from gunicorn master (CoW — no model duplication)
       GUNICORN_SPAWN_CELERY: "1"
     networks:
-      - xplagiax-net
+      # Fix #1: expose the canonical hostname `xplagiax-xota` so other compose
+      # projects (marktrack) can reach this service. The Compose service is
+      # named `web`, so without this alias `http://xplagiax-xota:5006` does not
+      # resolve from another project's containers.
+      xplagiax-net:
+        aliases:
+          - xplagiax-xota
     depends_on:
       redis:
         condition: service_healthy
@@ -94,5 +103,11 @@ services:
       retries: 3
 
 networks:
+  # Fix #1: pin the literal network name so Compose does NOT prefix it with the
+  # project name (it would become `xplagiax_xota_xplagiax-net` otherwise).
+  # marktrack joins this same network as `external: true, name: xplagiax-net`.
+  # Bring xota up first (it creates the network) or pre-create it once with:
+  #   docker network create xplagiax-net
   xplagiax-net:
+    name: xplagiax-net
     driver: bridge

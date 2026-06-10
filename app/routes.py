@@ -287,6 +287,12 @@ def analyze_document_async():
     if not text or not isinstance(text, str):
         return jsonify({"error": "'text' field is required and must be a non-empty string"}), 400
 
+    # Fix #5: cap payload size like the other endpoints. Without this an oversized
+    # text slows the JSON parse and bloats the Redis broker payload on enqueue,
+    # turning the "instant" 202 endpoint slow (and risking worker OOM later).
+    if len(text) > _MAX_TEXT_CHARS:
+        return jsonify({"error": f"Text too large. Maximum {_MAX_TEXT_CHARS} characters."}), 413
+
     # Optional plugins
     plugins_requested = payload.get("plugins", ["ai_detection"])
     if not isinstance(plugins_requested, list) or not plugins_requested:
