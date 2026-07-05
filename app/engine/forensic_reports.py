@@ -70,7 +70,19 @@ class ForensicReport:
     comparison_chart_b64: Optional[str] = None
 
 
+#: [D-3] Display-only disclaimer for the word/sentence heatmaps. These attributions
+#: are nudged by the hardcoded buzzword lexicon below, which is biased against formal,
+#: academic, legal and non-native (ESL) writing. They are a localization aid ONLY and
+#: do not contribute to the verdict (see generate_report). Reports should surface this.
+ATTRIBUTION_DISCLAIMER = (
+    "Heatmap por palabra/oración: ayuda visual heurística (no calibrada, sesgada "
+    "contra escritura formal/académica/legal/ESL). No determina el veredicto."
+)
+
+
 class AttributionCalculator:
+    """Per-word/sentence colouring for the heatmap. DISPLAY-ONLY (see ATTRIBUTION_DISCLAIMER)."""
+
     AI_INDICATOR_WORDS = {
         "furthermore": 0.8, "moreover": 0.8, "additionally": 0.7,
         "consequently": 0.85, "therefore": 0.7, "thus": 0.7,
@@ -1042,12 +1054,17 @@ class ForensicReportGenerator:
         else:
             overall_score, verdict, neural_score = 0.5, "Inconclusive", 0.5
 
+        # [D-3 FIX] Per-word/sentence attributions are a DISPLAY-ONLY heatmap aid:
+        # they start from the neural overall_score and are nudged by a hardcoded
+        # buzzword lexicon ("delve"/"furthermore" = AI), which is biased against
+        # formal/academic/legal/ESL writing. They must NOT move the verdict.
+        # The "Hybrid" decision now comes from the real per-paragraph NEURAL analysis
+        # (HybridSegmentAnalyzer), not from lexicon-nudged sentence means.
         sentence_attrs = self.attribution_calc.calculate_sentence_attributions(text, overall_score)
-        if len(sentence_attrs) >= 6:
-            half = len(sentence_attrs) // 2
-            fm = float(np.mean([s.ai_score for s in sentence_attrs[:half]]))
-            sm = float(np.mean([s.ai_score for s in sentence_attrs[half:]]))
-            if abs(fm - sm) > 0.25 and ((fm > 0.5) != (sm > 0.5)): verdict = "Hybrid"
+        _hybrid = additional.get("hybrid_segment") or {}
+        _hybrid_class = str(_hybrid.get("classification", "")).upper()
+        if "HYBRID" in _hybrid_class or "MIXED" in _hybrid_class:
+            verdict = "Hybrid"
 
         stat = additional.get("statistical", {})
         statistical_score = stat.get("score", 0.5)
@@ -1113,6 +1130,30 @@ class ForensicReportGenerator:
 
         reasoning_score = additional.get("reasoning", {}).get("ai_score", 0.5)
         watermark_score = additional.get("watermark", {}).get("confidence", 0.0)
+
+        # ── LATE FUSION [Fase 2 activated] ────────────────────────────────────
+        # The verdict no longer depends on the neural ensemble ALONE. When FUSION_ACTIVE
+        # (default), a bounded, model-agnostic, UNCALIBRATED fusion of all plugin signals
+        # produces P(AI); the neural ensemble dominates but plugins now genuinely move the
+        # result. neural_score is preserved separately so the report can show both. The
+        # confidence is explicitly flagged uncalibrated (no labelled corpus yet).
+        # The orchestrator normally computes this already (in additional["fusion"]); we
+        # reuse it when present and only compute as a standalone fallback.
+        import os as _os
+        if _os.getenv("FUSION_ACTIVE", "1") == "1" and detection_result is not None:
+            try:
+                fused = additional.get("fusion")
+                if fused is None:
+                    from fusion import FusionClassifier
+                    fused = FusionClassifier().predict_proba(detection_result, additional).to_dict()
+                    additional["fusion"] = fused
+                overall_score = float(np.clip(fused["probability"], 0.0, 1.0))
+                # Keep an explicit Hybrid verdict (set from per-paragraph analysis); else
+                # let the fused probability decide AI vs Human.
+                if verdict != "Hybrid" and verdict != "Inconclusive":
+                    verdict = "AI-Generated" if overall_score >= 0.5 else "Human-Written"
+            except Exception as exc:
+                logger.warning("Fusion scoring failed, falling back to neural-only: %s", exc)
 
         # [FIX v3.7] Now collect evidence AFTER all analyses are complete
         evidence_points = self._collect_evidence(sentence_attrs, additional)
@@ -2382,7 +2423,8 @@ th{{background:linear-gradient(135deg,#2c3e50,#34495e);color:white;font-weight:6
 <h2 class="section-header" onclick="toggleSection('heatmap-section')">
   Word-Level AI Patterns <span class="toggle-icon">&#9660;</span>
 </h2>
-<div id="heatmap-section" class="collapsible-section"><div class="chart">{hm_img}</div></div>
+<div id="heatmap-section" class="collapsible-section"><div class="chart">{hm_img}</div>
+  <p style="font-size:0.8em;color:#888;font-style:italic;margin-top:6px">{ATTRIBUTION_DISCLAIMER}</p></div>
 
 <h2 class="section-header" onclick="toggleSection('sentence-chart-section')">
   Sentence-by-Sentence AI Scores <span class="toggle-icon">&#9660;</span>

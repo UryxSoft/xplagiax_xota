@@ -58,7 +58,13 @@ class Config:
     CACHE_DEFAULT_TIMEOUT = 300
     # Explicit pool cap — prevents runaway connections under burst traffic.
     REDIS_MAX_CONNECTIONS = int(os.environ.get("REDIS_MAX_CONNECTIONS", "10"))
-    CACHE_OPTIONS = {"max_connections": REDIS_MAX_CONNECTIONS}
+    # max_connections is a RedisCache pool option — SimpleCache (used when no
+    # REDIS_URL) rejects it and would crash create_app() on flask-caching >= 2.3.
+    # Only pass it when actually using Redis.
+    CACHE_OPTIONS = (
+        {"max_connections": REDIS_MAX_CONNECTIONS}
+        if os.environ.get("REDIS_URL") else {}
+    )
 
     # ── Compression (Flask-Compress) ───────────────────────────────
     COMPRESS_ALGORITHM = "gzip"

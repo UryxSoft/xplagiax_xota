@@ -11,6 +11,18 @@ torch.set_grad_enabled(False)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger = logging.getLogger(__name__)
+
+# [C-12 FIX] Cap torch intra-op threads to avoid CPU over-subscription.
+# Concurrency already comes from gunicorn gthread workers × the plugin
+# ThreadPoolExecutor (plugin_registry.py) × per-document batching. Letting torch
+# also spin up one BLAS thread per core multiplies into cores² runnable threads,
+# causing context-switch thrashing and p99 latency blow-ups on CPU. Default 1;
+# override with TORCH_NUM_THREADS when running a single-request, latency-bound box.
+if device.type == "cpu":
+    try:
+        torch.set_num_threads(int(os.getenv("TORCH_NUM_THREADS", "1")))
+    except (ValueError, RuntimeError) as _thr_err:
+        logger.warning("Could not set torch num_threads: %s", _thr_err)
 import re
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass, field
@@ -91,6 +103,7 @@ class DetectionResult:
     raw_scores:           Dict[str, float]
     statistical_features: Dict[str, float] = field(default_factory=dict)
     uncertainty_zone:     bool = False
+    ensemble_disagreement: float = 0.0   # std (pct points) of per-seed AI prob; higher = less certain
 
 
 def clean_text(text: str) -> str:
@@ -111,10 +124,16 @@ tokenizer.backend_tokenizer.normalizer = Sequence([
 # [MODIFIED v1.1] Returns 3-tuple: (result_message, fig, DetectionResult).
 # All inference logic is IDENTICAL to the original.
 
-def classify_text(text):
+def classify_text(text, generate_plot: bool = False):
     """
-    Classifies the text and generates a plot of the human vs AI probability.
-    Returns both the result message and the plot figure.
+    Classifies the text and (optionally) generates a plot of human vs AI probability.
+    Returns (result_message, fig, DetectionResult).
+
+    [C-01 FIX] generate_plot defaults to False. The pyplot global state is NOT
+    thread-safe, and this function is reached from the ThreadPoolExecutor that runs
+    plugins (plugin_registry.py). Building a figure via plt.* under concurrency can
+    corrupt state or crash. The API path discards `fig`, so by default we skip it.
+    Set generate_plot=True only from single-threaded callers (e.g. Gradio).
     """
     cleaned_text = clean_text(text)
     if not cleaned_text.strip():
@@ -124,7 +143,7 @@ def classify_text(text):
             human_percentage=50,
             ai_percentage=50,
             detected_model=None,
-            raw_scores={"human": 0, "ai_total": 0},
+            raw_scores={"human": 0.0, "ai": 0.0},
             uncertainty_zone=True,
         )
         return "", None, empty_result
@@ -164,24 +183,36 @@ def classify_text(text):
             f"**The text is** <span class='highlight-ai'>**{ai_percentage:.2f}%** likely <b>AI generated</b>.</span>\n\n"
         )
 
-    fig, ax = plt.subplots(figsize=(8, 4))  # Adjust figure size for better layout
+    # [C-02 FIX] Keep precise percentage raw_scores BEFORE rounding the display values.
+    # human_prob + ai_total_prob == 1.0 (softmax), so these are the real model scores
+    # on a [0,100] scale. Exposing the "ai" key fixes the dead-code path in
+    # forensic_reports.generate_report (which read a non-existent "ai" key) and the
+    # summary() display that printed 0.0/1.0 from round(prob).
+    raw_scores = {
+        "human": round(human_prob * 100, 2),
+        "ai": round(ai_total_prob * 100, 2),
+    }
 
-    categories = ['Human', 'AI']
-    probabilities_for_plot = [human_percentage, ai_percentage]
+    # [C-01 FIX] Only touch pyplot when explicitly requested by a single-threaded caller.
+    fig = None
+    if generate_plot and plt is not None:
+        fig, ax = plt.subplots(figsize=(8, 4))  # Adjust figure size for better layout
 
-    bars = ax.bar(categories, probabilities_for_plot, color=['#4CAF50', '#FF5733'], alpha=0.8)
-    ax.set_ylabel('Probability (%)', fontsize=12)
-    ax.set_title('Human vs AI Probability', fontsize=14, fontweight='bold')
-    ax.grid(axis='y', linestyle='--', alpha=0.6)
+        categories = ['Human', 'AI']
+        probabilities_for_plot = [human_percentage, ai_percentage]
 
-    # Add labels to the bars
-    for bar in bars:
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2, height + 1, f'{height:.2f}%', ha='center')
+        bars = ax.bar(categories, probabilities_for_plot, color=['#4CAF50', '#FF5733'], alpha=0.8)
+        ax.set_ylabel('Probability (%)', fontsize=12)
+        ax.set_title('Human vs AI Probability', fontsize=14, fontweight='bold')
+        ax.grid(axis='y', linestyle='--', alpha=0.6)
 
+        # Add labels to the bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2, height + 1, f'{height:.2f}%', ha='center')
 
-    ax.set_ylim(0, 100)
-    plt.tight_layout()
+        ax.set_ylim(0, 100)
+        plt.tight_layout()
 
     human_percentage = round(human_percentage)
     ai_percentage    = round(ai_percentage)
@@ -192,15 +223,17 @@ def classify_text(text):
         human_percentage=human_percentage,
         ai_percentage=ai_percentage,
         detected_model=ai_argmax_model if ai_percentage > human_percentage else None,
-        raw_scores={"human": round(human_prob), "ai_total": round(ai_total_prob)}
+        raw_scores=raw_scores,
     )
 
-    plt.close(fig)
+    if fig is not None:
+        plt.close(fig)
     return result_message, fig, det_result
 
 # [ADDED v1.1] Gradio wrapper — unpacks only (msg, fig) for Gradio outputs.
 def _gradio_classify(text: str):
-    msg, fig, _ = classify_text(text)
+    # Gradio runs single-threaded for this call → safe to build the pyplot figure.
+    msg, fig, _ = classify_text(text, generate_plot=True)
     return msg, fig
 
 
@@ -258,12 +291,13 @@ def classify_segment(text: str) -> Tuple[float, float]:
 
 
 @torch.inference_mode()
-def _classify_batch_from_ids(id_seqs: List[List[int]]) -> List[Tuple[float, float, Optional[str]]]:
+def _classify_batch_from_ids(id_seqs: List[List[int]]) -> List[Tuple[float, float, Optional[str], float]]:
     """
     Inference directly on pre-tokenized ID sequences — no decode→re-encode round-trip.
 
-    Returns List of (human_pct, ai_pct, detected_model) where detected_model is
-    the highest-probability AI model label (or None when human wins).
+    Returns List of (human_pct, ai_pct, detected_model, ensemble_disagreement) where
+    detected_model is the highest-probability AI model label (or None when human wins) and
+    ensemble_disagreement is the std (in percentage points) of the per-seed AI probability.
 
     id_seqs must NOT contain special tokens; this function adds them via
     tokenizer.build_inputs_with_special_tokens (model-agnostic).
@@ -295,11 +329,17 @@ def _classify_batch_from_ids(id_seqs: List[List[int]]) -> List[Tuple[float, floa
     logits_2 = model_2(input_ids=input_ids, attention_mask=attention_mask).logits
     logits_3 = model_3(input_ids=input_ids, attention_mask=attention_mask).logits
 
-    avg_probs = (
-        torch.softmax(logits_1, dim=1)
-        + torch.softmax(logits_2, dim=1)
-        + torch.softmax(logits_3, dim=1)
-    ) / 3
+    sm1 = torch.softmax(logits_1, dim=1)
+    sm2 = torch.softmax(logits_2, dim=1)
+    sm3 = torch.softmax(logits_3, dim=1)
+    avg_probs = (sm1 + sm2 + sm3) / 3
+
+    # Ensemble disagreement: std of the per-seed AI probability (1 - human@24) across the
+    # 3 ModernBERT seeds. This is a FREE, dataset-free uncertainty signal — high disagreement
+    # means the models are unsure (e.g. out-of-distribution frontier-model text), so callers
+    # can widen uncertainty / lower confidence instead of reporting a falsely crisp verdict.
+    ai_stack = torch.stack([1.0 - sm1[:, 24], 1.0 - sm2[:, 24], 1.0 - sm3[:, 24]], dim=1)
+    disagreement = (ai_stack.std(dim=1, unbiased=False) * 100.0)  # percentage points
 
     results = []
     for i in range(len(id_seqs)):
@@ -310,7 +350,7 @@ def _classify_batch_from_ids(id_seqs: List[List[int]]) -> List[Tuple[float, floa
         ai_clone = probs.clone()
         ai_clone[24] = 0.0
         detected_model: Optional[str] = label_mapping[int(torch.argmax(ai_clone).item())] if ai_pct > human_pct else None
-        results.append((human_pct, ai_pct, detected_model))
+        results.append((human_pct, ai_pct, detected_model, round(float(disagreement[i].item()), 2)))
     return results
 
 
@@ -343,53 +383,50 @@ def validar_veredicto_segmento(segmento_dict: dict) -> dict:
     perplejidad  = analisis.get("perplexity", {})
     referencias  = analisis.get("reference_check", {})
 
-    # ── 1. CRITERIO DE DESCARTE (Falso Positivo) ──────────────────────────
-    # Si el modelo dice IA pero no hay indicadores forenses y la confianza base
-    # no es muy alta (<= 80%), es probable que sea un falso positivo.
-    # Guardia: no se descarta cuando el ensemble base tiene >= 85% de confianza.
-    base_score_for_discard = segmento_dict.get("score", 0.0)
-    base_label_for_discard = segmento_dict.get("dominant_label", "")
-    high_confidence_ai = "AI" in base_label_for_discard and base_score_for_discard >= 85.0
+    # [C-04 FIX] This routine used to OVERRIDE the neural verdict with hard rules:
+    # it flipped `score = 100 - score` / relabelled to "Human (Validated)", and forced
+    # `score = 100.0` / "AI (Confirmed)" on a single fabricated-citation signal. That
+    # is indefensible forensically (a weak heuristic overriding the model at 100%
+    # confidence). It is now NON-DESTRUCTIVE: it never changes `dominant_label` or
+    # `score`; it only attaches advisory annotations under `forensic_flags` that the
+    # report can surface as *supporting evidence*, not as a verdict.
+    flags = segmento_dict.setdefault("forensic_flags", [])
+
+    # ── 1. SOPORTE "HUMANO": ausencia de señales forenses de IA ───────────
+    base_score = segmento_dict.get("score", 0.0)
+    base_label = segmento_dict.get("dominant_label", "")
+    high_confidence_ai = "AI" in base_label and base_score >= 85.0
     if (
         razonamiento.get("ai_score", 0) < 0.25
         and perplejidad.get("ai_score", 0) < 0.40
         and not high_confidence_ai
     ):
-        segmento_dict["dominant_label"] = "Human (Validated)"
-        segmento_dict["score"] = 100 - segmento_dict["score"]
-        segmento_dict["status_note"] = (
-            "Descartado: Los plugins forenses confirman estructura humana natural."
-        )
+        flags.append({
+            "type": "human_supporting",
+            "note": "Los plugins forenses no muestran señales de IA (razonamiento y "
+                    "perplejidad bajos). Soporte débil de autoría humana — no concluyente.",
+        })
 
-    # ── 2. CRITERIO DE CONFIRMACIÓN (Alucinación detectada) ───────────────
-    # [FIX v1.3] Condiciones de guardia para evitar falsos positivos
-    # causados por extracción espuria de texto estructural como referencias.
-    #
-    # Condiciones requeridas (TODAS deben cumplirse):
-    #   a) Al menos 2 referencias extraídas (evita falsos positivos
-    #      de una sola extracción sobre texto de sección/imagen)
-    #   b) Ratio de fabricación >= 70% (mayoría clara de citas inválidas)
-    #   c) El modelo base ya sospechaba IA en este segmento
-    #      (label contiene "AI" y score > 50)
+    # ── 2. SOPORTE "IA": alucinaciones bibliográficas ─────────────────────
+    # Guardas para evitar falsos positivos por extracción espuria de texto
+    # estructural como referencias. Sigue siendo *evidencia*, no veredicto.
     feat_vals   = referencias.get("feature_values", {})
     fab_count   = feat_vals.get("fabricated_count", 0)
     total_refs  = feat_vals.get("total_references", 0)
     fab_ratio   = feat_vals.get("fabricated_ratio", 0.0)
-    base_score  = segmento_dict.get("score", 0.0)
-    base_label  = segmento_dict.get("dominant_label", "")
 
     if (
         fab_count > 0
-        and total_refs >= 2                  # guardia (a): más de una referencia
-        and fab_ratio >= 0.70               # guardia (b): mayoría de citas inválidas
-        and "AI" in base_label              # guardia (c): modelo base ya sospechaba IA
-        and base_score > 50.0              # guardia (c): confianza mínima en IA
+        and total_refs >= 2          # guardia (a): más de una referencia
+        and fab_ratio >= 0.70        # guardia (b): mayoría de citas inválidas
+        and "AI" in base_label       # guardia (c): el modelo base ya sospechaba IA
+        and base_score > 50.0        # guardia (c): confianza mínima en IA
     ):
-        segmento_dict["dominant_label"] = "AI (Confirmed)"
-        segmento_dict["score"] = 100.0
-        segmento_dict["status_note"] = (
-            "Confirmado: Se detectaron alucinaciones bibliográficas (citas inventadas)."
-        )
+        flags.append({
+            "type": "ai_supporting",
+            "note": "Se detectaron citas bibliográficas no verificables en múltiples "
+                    "referencias. Evidencia de soporte de generación por IA — no concluyente.",
+        })
 
     return segmento_dict
 
@@ -621,6 +658,20 @@ _FAST_CACHE_TTL: float = 300.0   # 5 minutes — covers same-request multi-plugi
 _FAST_CACHE_MAX: int = 20        # keep memory bounded; LRU eviction
 
 
+def _cache_namespace() -> str:
+    """[C-17] Namespace the result cache by model identity + version so a model/weights
+    swap (or MODEL_VERSION bump) never serves stale verdicts keyed only by text hash."""
+    try:
+        ident = f"{getattr(model_1.config, '_name_or_path', 'm')}:{model_1.config.num_labels}"
+    except Exception:
+        ident = "default"
+    ident += ":" + os.environ.get("MODEL_VERSION", "")
+    return _hashlib.sha1(ident.encode()).hexdigest()[:10]
+
+
+_CACHE_NS: str = _cache_namespace()
+
+
 @torch.inference_mode()
 def analyze_fast(text: str) -> dict:
     """
@@ -640,8 +691,9 @@ def analyze_fast(text: str) -> dict:
     if not text.strip():
         return {"error": "El documento está vacío."}
 
-    # Cache on raw text (before cleaning) to preserve hit rate across callers
-    _text_hash = _hashlib.sha256(text.encode()).hexdigest()
+    # Cache on raw text (before cleaning) to preserve hit rate across callers,
+    # namespaced by model version so a model swap invalidates stale entries (C-17).
+    _text_hash = _CACHE_NS + ":" + _hashlib.sha256(text.encode()).hexdigest()
     _now = _time.monotonic()
     with _FAST_CACHE_LOCK:
         _entry = _FAST_CACHE.get(_text_hash)
@@ -675,16 +727,17 @@ def analyze_fast(text: str) -> dict:
     ]
 
     # 3. Ensemble inference — same 3-model softmax average as reference classify_text()
-    all_pcts: List[Tuple[float, float, Optional[str]]] = []
+    all_pcts: List[Tuple[float, float, Optional[str], float]] = []
     for i in range(0, len(segment_id_seqs), BATCH_SIZE):
         all_pcts.extend(_classify_batch_from_ids(segment_id_seqs[i:i + BATCH_SIZE]))
 
     # 4. Per-segment results + token-weighted aggregate
     segments = []
     total_human_w = total_ai_w = total_len = 0
+    total_disagree_w = 0.0
     detected_model_votes: Dict[str, float] = {}
 
-    for idx, ((human_pct, ai_pct, det_model), ids, seg_text) in enumerate(
+    for idx, ((human_pct, ai_pct, det_model, disagree), ids, seg_text) in enumerate(
         zip(all_pcts, segment_id_seqs, segments_text)
     ):
         tok_len = len(ids)
@@ -693,9 +746,11 @@ def analyze_fast(text: str) -> dict:
             "text": seg_text,
             "dominant_label": "AI" if ai_pct > human_pct else "Human",
             "score": max(ai_pct, human_pct),
+            "ensemble_disagreement": disagree,
         })
         total_human_w += human_pct * tok_len
         total_ai_w += ai_pct * tok_len
+        total_disagree_w += disagree * tok_len
         total_len += tok_len
         if det_model is not None:
             detected_model_votes[det_model] = detected_model_votes.get(det_model, 0.0) + tok_len
@@ -705,6 +760,7 @@ def analyze_fast(text: str) -> dict:
 
     overall_human = round(total_human_w / total_len)
     overall_ai = round(total_ai_w / total_len)
+    overall_disagree = round(total_disagree_w / total_len, 2)
     overall_detected = max(detected_model_votes, key=detected_model_votes.get) if detected_model_votes else None
 
     _result = {
@@ -713,9 +769,50 @@ def analyze_fast(text: str) -> dict:
             "total_ai_percentage": overall_ai,
             "overall_prediction": "AI" if overall_ai > overall_human else "Human",
             "detected_model": overall_detected,
+            "ensemble_disagreement": overall_disagree,
         },
         "segments": segments,
     }
     with _FAST_CACHE_LOCK:
         _FAST_CACHE[_text_hash] = (_result, _time.monotonic())
     return _result
+
+
+def classify_text_aggregate(text: str) -> DetectionResult:
+    """
+    Document-level DetectionResult covering the FULL text.
+
+    [C-04/§13 FIX] classify_text() tokenizes with truncation=True, so for documents
+    longer than the model's max length (~512 tokens) it only classifies the first
+    chunk — the forensic verdict then ignores the bulk of a long document. This
+    helper instead reuses analyze_fast(), whose per-segment, token-weighted aggregate
+    spans the whole text, and packages it as a DetectionResult so PluginOrchestrator
+    produces a verdict representative of the entire document.
+
+    Falls back to a neutral Unknown result on empty/error input.
+    """
+    doc = analyze_fast(text)
+    if not isinstance(doc, dict) or "error" in doc:
+        return DetectionResult(
+            prediction="Unknown", confidence=0,
+            human_percentage=50, ai_percentage=50,
+            detected_model=None, raw_scores={"human": 0.0, "ai": 0.0},
+            uncertainty_zone=True,
+        )
+    s = doc.get("overall_summary", {})
+    human = s.get("total_human_percentage", 50)
+    ai = s.get("total_ai_percentage", 50)
+    prediction = s.get("overall_prediction", "Human")
+    disagree = float(s.get("ensemble_disagreement", 0.0))
+    # Uncertain when the margin is thin OR the 3 seeds disagree markedly (OOD signal).
+    uncertain = abs(ai - human) < 15 or disagree >= 12.0
+    return DetectionResult(
+        prediction=prediction,
+        confidence=round(max(human, ai)),
+        human_percentage=human,
+        ai_percentage=ai,
+        detected_model=s.get("detected_model") if prediction == "AI" else None,
+        raw_scores={"human": float(human), "ai": float(ai)},
+        uncertainty_zone=uncertain,
+        ensemble_disagreement=disagree,
+    )

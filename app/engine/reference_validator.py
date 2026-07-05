@@ -788,6 +788,38 @@ def _compute_confidence(ref: ParsedReference, candidate: dict) -> Tuple[float, L
     return max(0.0, min(100.0, score)), issues, _is_chimeric
 
 
+# Minimum sources that must be queried (and miss) before a "not_found" can be
+# treated as a fabrication rather than merely "not indexed".
+_FABRICATION_MIN_SOURCES: int = 2
+# Minimum title length (chars) for a reference to look like a real citation.
+_FABRICATION_MIN_TITLE_CHARS: int = 12
+
+
+def _looks_fabricated(v: "ValidationResult") -> bool:
+    """
+    [Fase 1.10] Distinguish a *fabricated* reference (a real-looking citation that
+    does not exist) from one that is merely *not indexed* (new paper, book, preprint,
+    non-indexed venue) or a *spurious extraction* (section header / image alt-text
+    captured as a citation).
+
+    A "not_found" is counted as fabricated ONLY when:
+      1. it was queried against ≥ _FABRICATION_MIN_SOURCES databases and missed in all, and
+      2. the reference is structurally complete (plausible title + ≥1 author + a year).
+
+    Everything else is "not_indexed" and must NOT inflate the fabrication signal that
+    feeds the high-severity evidence path.
+    """
+    if v.status != "not_found":
+        return False
+    if len(set(v.sources_checked)) < _FABRICATION_MIN_SOURCES:
+        return False
+    ref = v.reference
+    has_title = len((ref.title or "").strip()) >= _FABRICATION_MIN_TITLE_CHARS
+    has_author = len(ref.authors) >= 1
+    has_year = ref.year is not None
+    return has_title and has_author and has_year
+
+
 # ============================================================================
 # REFERENCE VALIDATOR — Main Plugin Class
 # ============================================================================
@@ -896,7 +928,10 @@ class ReferenceValidator:
 
         scores = [v.confidence_score for v in validations]
         verified = sum(1 for v in validations if v.status == "verified")
-        fabricated = sum(1 for v in validations if v.status == "not_found")
+        # [Fase 1.10] Split "not_found" into true fabrications vs merely not-indexed.
+        not_found_all = [v for v in validations if v.status == "not_found"]
+        fabricated = sum(1 for v in not_found_all if _looks_fabricated(v))
+        not_indexed = len(not_found_all) - fabricated
         chimeric = sum(1 for v in validations if v.is_chimeric)
         partial = sum(1 for v in validations if v.status == "partial")
         ornamental = sum(1 for v in validations if v.is_ornamental)
@@ -908,6 +943,7 @@ class ReferenceValidator:
 
         result["verified_ratio"] = verified / total
         result["fabricated_ratio"] = fabricated / total
+        result["not_indexed_ratio"] = not_indexed / total
         result["chimeric_ratio"] = chimeric / total
         result["partial_match_ratio"] = partial / total
         result["ornamental_ratio"] = ornamental / total
@@ -921,6 +957,7 @@ class ReferenceValidator:
         # [FIX v3.9] Explicit counts for forensic_reports.py evidence collection
         result["verified_count"] = float(verified)
         result["fabricated_count"] = float(fabricated)
+        result["not_indexed_count"] = float(not_indexed)
         result["chimeric_count"] = float(chimeric)
         result["ornamental_count"] = float(ornamental)
         result["partial_count"] = float(partial)

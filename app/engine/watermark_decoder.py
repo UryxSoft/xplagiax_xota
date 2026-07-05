@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -113,6 +114,13 @@ _FLOAT_EPS: float = 1e-9
 
 _WINDOW_OVERLAP: int = 64
 """Token overlap between sliding-window chunks (P2-4)."""
+
+_MAX_ENTROPY_TOKENS: int = 8192
+"""[C-14] Hard cap on tokens scanned for entropy/watermark periodicity. Each window is a
+full GPT-2 forward pass over ~1024 tokens × 50K vocab; an uncapped long document (e.g. a
+50-page thesis ≈ 30K tokens) would run dozens of passes, spiking CPU/RAM/latency. 8192
+tokens (~8 windows) is a statistically representative sample for periodicity detection.
+Overridable via WATERMARK_MAX_ENTROPY_TOKENS."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -501,6 +509,11 @@ class EntropyAnalyzer:
         )
         if len(all_ids) < _MIN_ENTROPY_TOKENS:
             return self._empty_stats()
+
+        # [C-14] Cap the scanned tokens so long documents don't run dozens of GPT-2 passes.
+        _cap = int(os.getenv("WATERMARK_MAX_ENTROPY_TOKENS", _MAX_ENTROPY_TOKENS))
+        if _cap > 0 and len(all_ids) > _cap:
+            all_ids = all_ids[:_cap]
 
         # Sliding-window inference with per-chunk entropy reduction.
         # Only 1D numpy arrays are kept — zero logit tensors retained.

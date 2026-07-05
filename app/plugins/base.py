@@ -55,3 +55,22 @@ class BasePlugin(ABC):
         and is shared via CoW across all workers.
         """
         pass
+
+    def health(self) -> bool:
+        """
+        Optional — report whether the plugin's heavy backend loaded successfully.
+
+        Pure-Python plugins are always healthy (default True). Plugins that wrap a
+        model/engine should override this to return their module-level availability
+        flag, so /ready can fail honestly instead of reporting a plugin as "ready"
+        while its model silently failed to load (audit C-09/C-10/C-11).
+        """
+        return True
+
+    def is_core(self) -> bool:
+        """
+        Optional — True if this plugin is required for the service to be considered
+        ready (e.g. the primary AI detector). If any core plugin is unhealthy, /ready
+        returns 503. Default False.
+        """
+        return False

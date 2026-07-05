@@ -31,6 +31,9 @@ class WatermarkDetectionPlugin(BasePlugin):
     def name(self) -> str:
         return "watermark_detection"
 
+    def health(self) -> bool:
+        return _available
+
     def description(self) -> str:
         return (
             "Detect statistical watermarks embedded in text by AI models "
