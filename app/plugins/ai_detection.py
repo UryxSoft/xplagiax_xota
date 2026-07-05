@@ -29,6 +29,13 @@ class AIDetectionPlugin(BasePlugin):
     def name(self) -> str:
         return "ai_detection"
 
+    def is_core(self) -> bool:
+        # Primary AI detector — /ready must fail if this engine did not load.
+        return True
+
+    def health(self) -> bool:
+        return _available
+
     def description(self) -> str:
         return "Quick AI vs Human binary classification with semantic segmentation (ModernBERT ensemble)."
 

@@ -31,6 +31,9 @@ class HallucinationCheckPlugin(BasePlugin):
     def name(self) -> str:
         return "hallucination_check"
 
+    def health(self) -> bool:
+        return _available
+
     def description(self) -> str:
         return (
             "Detect AI fabrication risk: internal inconsistencies, factual drift, "

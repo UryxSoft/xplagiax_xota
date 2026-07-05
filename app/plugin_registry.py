@@ -55,6 +55,34 @@ class PluginRegistry:
             for p in sorted(self._plugins.values(), key=lambda x: x.name())
         ]
 
+    def health_report(self) -> Dict[str, bool]:
+        """
+        Map plugin name -> health() (audit C-09/C-10/C-11).
+
+        A plugin whose heavy backend silently failed to load reports False here, so
+        callers (e.g. /ready) can surface degradation instead of pretending the
+        plugin is operational just because it registered.
+        """
+        report: Dict[str, bool] = {}
+        for name, p in self._plugins.items():
+            try:
+                report[name] = bool(p.health())
+            except Exception as exc:  # a broken plugin is, by definition, unhealthy
+                logger.warning("health() raised for plugin '%s': %s", name, exc)
+                report[name] = False
+        return report
+
+    def core_unhealthy(self) -> List[str]:
+        """Names of core plugins (is_core() True) whose backend failed to load."""
+        down: List[str] = []
+        for name, p in self._plugins.items():
+            try:
+                if p.is_core() and not p.health():
+                    down.append(name)
+            except Exception:
+                down.append(name)
+        return down
+
     def run(self, plugin_names: List[str], text: str,
             timeout: int = 30) -> Dict[str, Any]:
         """

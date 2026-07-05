@@ -112,6 +112,9 @@ class PluginConfig:
     enable_perplexity:      bool = True     # [NEW v3.7] Perplexity profiler
     enable_hybrid_segment:  bool = True     # [NEW v3.9] Per-paragraph heatmap
     enable_reference_check: bool = False    # [NEW v3.9] Citation validator (requires network)
+    enable_author_signature: bool = True    # [Tier1] Intra-document authorship consistency
+    enable_discourse:        bool = True    # [Tier1] Discourse-structure uniformity (model-agnostic)
+    enable_semantic_consistency: bool = True  # [Tier1] Internal-contradiction detection
     enable_watermark:       bool = False
     enable_forensic_report: bool = True
     forensic_output_path:   str  = field(default_factory=_unique_report_path)
@@ -173,6 +176,8 @@ class PluginOrchestrator:
         self._hybrid_analyzer:          Any = None      # [NEW v3.9]
         self._reference_validator:      Any = None      # [NEW v3.9]
         self._reference_classifier:     Any = None      # [NEW v3.9]
+        self._discourse_analyzer:       Any = None      # [Tier1]
+        self._semantic_analyzer:        Any = None      # [Tier1]
         self._watermark_decoder:        Any = None
         self._forensic_generator:       Any = None
         self._init_plugins()
@@ -265,6 +270,22 @@ class PluginOrchestrator:
             except ImportError as exc:
                 logger.warning("ReferenceValidator unavailable: %s", exc)
 
+        if cfg.enable_discourse:
+            try:
+                from discourse_analyzer import DiscourseAnalyzer
+                self._discourse_analyzer = DiscourseAnalyzer()
+                logger.info("DiscourseAnalyzer loaded")
+            except Exception as exc:  # noqa: BLE001 — pure-Python, but stay defensive
+                logger.warning("DiscourseAnalyzer unavailable: %s", exc)
+
+        if cfg.enable_semantic_consistency:
+            try:
+                from semantic_consistency import SemanticConsistencyAnalyzer
+                self._semantic_analyzer = SemanticConsistencyAnalyzer()
+                logger.info("SemanticConsistencyAnalyzer loaded")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SemanticConsistencyAnalyzer unavailable: %s", exc)
+
         if cfg.enable_forensic_report:
             try:
                 from forensic_reports import ForensicReportGenerator
@@ -291,8 +312,11 @@ class PluginOrchestrator:
             "additional_analyses" : dict of plugin outputs
             "forensic_report"     : ForensicReport | None
         """
-        from detector_final import classify_text
-        _, _, detection_result = classify_text(text)
+        # [C-04/§13 FIX] Use the document-level aggregate (covers the FULL text)
+        # instead of classify_text(), which truncates to the model's ~512-token
+        # window and would make the forensic verdict ignore most of a long document.
+        from detector_final import classify_text_aggregate
+        detection_result = classify_text_aggregate(text)
         return self.run_with_result(text, detection_result)
 
     def run_with_result(self, text: str, detection_result: Any) -> Dict[str, Any]:
@@ -442,6 +466,39 @@ class PluginOrchestrator:
                 )
             except Exception as exc:
                 logger.warning("WatermarkDecoder.detect() failed: %s", exc)
+
+        # ── Tier-1 model-agnostic signals (feed the fusion + reported standalone) ──
+        if self.config.enable_author_signature and self._stylometric is not None:
+            try:
+                from authorship_consistency import compute_authorship_consistency
+                additional["author_signature"] = compute_authorship_consistency(
+                    self._stylometric, text)
+            except Exception as exc:
+                logger.warning("authorship_consistency failed: %s", exc)
+
+        if self._discourse_analyzer is not None:
+            try:
+                additional["discourse_structure"] = self._discourse_analyzer.analyze(text)
+            except Exception as exc:
+                logger.warning("discourse analysis failed: %s", exc)
+
+        if self._semantic_analyzer is not None:
+            try:
+                additional["semantic_consistency"] = self._semantic_analyzer.analyze(text)
+            except Exception as exc:
+                logger.warning("semantic consistency failed: %s", exc)
+
+        # ── LATE FUSION (model-agnostic, bounded, UNCALIBRATED) ───────────
+        # Compute the fused P(AI) here, in the pipeline coordinator that owns `additional`,
+        # so it is BOTH visible in the returned additional_analyses AND consumed by the
+        # forensic verdict. The verdict no longer depends on the neural ensemble alone.
+        if os.getenv("FUSION_ACTIVE", "1") == "1" and detection_result is not None:
+            try:
+                from fusion import FusionClassifier
+                _fres = FusionClassifier().predict_proba(detection_result, additional)
+                additional["fusion"] = _fres.to_dict()
+            except Exception as exc:
+                logger.warning("Fusion scoring failed: %s", exc)
 
         # ── ForensicReportGenerator ───────────────────────────────────
         forensic_report = None

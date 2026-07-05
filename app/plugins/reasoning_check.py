@@ -32,6 +32,9 @@ class ReasoningCheckPlugin(BasePlugin):
     def name(self) -> str:
         return "reasoning_check"
 
+    def health(self) -> bool:
+        return _available
+
     def description(self) -> str:
         return (
             "Detect reasoning-model signals (o1, DeepSeek-R1): Chain-of-Thought "

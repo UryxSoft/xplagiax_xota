@@ -80,6 +80,9 @@ class FullAnalysisPlugin(BasePlugin):
     def name(self) -> str:
         return "full_analysis"
 
+    def health(self) -> bool:
+        return _available and get_orchestrator() is not None
+
     def description(self) -> str:
         return (
             "Complete XplagiaX forensic pipeline: ModernBERT detection, "
@@ -182,6 +185,11 @@ class FullAnalysisPlugin(BasePlugin):
                 "risk_level": rc.get("risk_level", "N/A"),
                 "total_references": rc.get("total_references", 0),
             }
+
+        # Tier-1 model-agnostic signals + the late-fusion verdict (surface verbatim).
+        for _key in ("author_signature", "discourse_structure", "semantic_consistency", "fusion"):
+            if _key in aa:
+                response[_key] = aa[_key]
 
         if _citation_detector is not None:
             try:

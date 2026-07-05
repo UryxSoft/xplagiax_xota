@@ -37,6 +37,9 @@ class CitationCheckPlugin(BasePlugin):
     def name(self) -> str:
         return "citation_check"
 
+    def health(self) -> bool:
+        return _available
+
     def description(self) -> str:
         return (
             "Verify citations against CrossRef, Semantic Scholar, and OpenAlex. "

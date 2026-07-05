@@ -979,8 +979,14 @@ class HallucinationRiskClassifier:
         else:
             level = "HIGH"
 
+        # [Fase 1.9 FIX] Rank signals by their WEIGHTED CONTRIBUTION to overall_risk
+        # (category_score × weight), not by raw feature magnitude. The old version
+        # sorted every stat by value, letting high-scale descriptive features (e.g.
+        # unigram_entropy ~10) dominate the "top signals" regardless of their actual
+        # weight — distorting the evidence shown to the user.
+        contributions = {k: categories[k] * weights[k] for k in categories}
         top_signals = sorted(
-            stats.items(), key=lambda x: x[1], reverse=True
+            contributions.items(), key=lambda x: x[1], reverse=True
         )[:_TOP_SIGNALS_K]
 
         return {
@@ -991,7 +997,12 @@ class HallucinationRiskClassifier:
                 k: round(v, 4) for k, v in categories.items()
             },
             "top_signals": [
-                {"feature": k, "value": round(v, 4)}
+                {
+                    "feature": k,              # category name (back-compat with HTML builder)
+                    "category": k,             # consumed at forensic_reports.py:896
+                    "value": round(v, 4),      # weighted contribution to overall_risk
+                    "category_score": round(categories[k], 4),
+                }
                 for k, v in top_signals
             ],
             "feature_details": stats,

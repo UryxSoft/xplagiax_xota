@@ -32,6 +32,9 @@ class ZoneClassifierPlugin(BasePlugin):
     def name(self) -> str:
         return "zone_classifier"
 
+    def health(self) -> bool:
+        return _available
+
     def description(self) -> str:
         return (
             "Classifies text zones (direct quotes, paraphrases, original content) "

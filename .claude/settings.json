@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -m pip install -q pytest)",
+      "Bash(.venv/bin/python -m pytest --version)",
+      "Bash(.venv/bin/python -c \"import sklearn; print\\('sklearn', sklearn.__version__\\)\")",
+      "Bash(.venv/bin/python -m pytest tests/test_fusion_calibration.py -q -p no:cacheprovider)",
+      "Bash(.venv/bin/python -m pip install -q scikit-learn)",
+      "Bash(grep -nc \"^import os$\" app/engine/detector_final.py)",
+      "Bash(.venv/bin/python -m py_compile app/engine/detector_final.py app/engine/watermark_decoder.py app/engine/fusion.py app/engine/forensic_reports.py app/engine/plugin_orchestrator.py)",
+      "Bash(export ENABLE_WATERMARK=0 ENABLE_REFERENCE_CHECK=0 PERPLEXITY_TIER2=0 TOKENIZERS_PARALLELISM=false)",
+      "Bash(timeout 600 .venv/bin/python -m pytest tests/test_engine.py tests/test_plugins.py -q -p no:cacheprovider)",
+      "Bash(xargs -n1 basename)",
+      "Bash(.venv/bin/python -m py_compile app/engine/authorship_consistency.py app/engine/discourse_analyzer.py app/engine/semantic_consistency.py app/plugins/author_signature.py app/plugins/discourse_structure.py app/plugins/semantic_consistency.py app/engine/fusion.py app/engine/plugin_orchestrator.py app/plugins/full_analysis.py)",
+      "Bash(.venv/bin/python -)",
+      "Bash(.venv/bin/python -m py_compile app/engine/authorship_consistency.py app/engine/discourse_analyzer.py app/engine/semantic_consistency.py app/plugins/author_signature.py app/plugins/discourse_structure.py app/plugins/semantic_consistency.py app/plugins/full_analysis.py app/engine/fusion.py app/engine/plugin_orchestrator.py app/routes.py)"
+    ]
+  }
+}

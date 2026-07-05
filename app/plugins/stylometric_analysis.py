@@ -29,6 +29,9 @@ class StylometricAnalysisPlugin(BasePlugin):
     def name(self) -> str:
         return "stylometric_analysis"
 
+    def health(self) -> bool:
+        return _available
+
     def description(self) -> str:
         return (
             "Analyze writing style fingerprint: sentence structure, vocabulary "

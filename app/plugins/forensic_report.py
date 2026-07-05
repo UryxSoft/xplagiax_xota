@@ -32,6 +32,9 @@ class ForensicReportPlugin(BasePlugin):
     def name(self) -> str:
         return "forensic_report"
 
+    def health(self) -> bool:
+        return _available
+
     def description(self) -> str:
         return (
             "Generate a full HTML forensic report with executive summary, "

@@ -36,6 +36,9 @@ class PerplexityCheckPlugin(BasePlugin):
     def name(self) -> str:
         return "perplexity_check"
 
+    def health(self) -> bool:
+        return _available
+
     def description(self) -> str:
         return (
             "Text predictability analysis — measures how 'predictable' the text "

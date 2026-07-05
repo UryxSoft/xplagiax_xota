@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import time
 import logging
 import functools
@@ -28,10 +29,15 @@ api_bp = Blueprint("api", __name__)
 _MAX_TEXT_CHARS = 500_000  # ~125 K words; prevents OOM on oversized payloads
 _ANALYSIS_CACHE_TTL = 3600  # 1 hour — analysis of identical text+plugins reuses result
 
+# [C-16 FIX] Cache key is namespaced by model version so a model/pipeline update
+# invalidates stale results instead of serving them for up to an hour. Bump
+# MODEL_VERSION (env or constant) whenever weights, thresholds, or fusion change.
+_MODEL_VERSION = os.getenv("MODEL_VERSION", "2026.06")
+
 
 def _analysis_cache_key(text: str, plugins: list) -> str:
-    """Deterministic cache key: sha256(text + sorted plugin list)."""
-    content = text + "\x00" + ",".join(sorted(plugins))
+    """Deterministic cache key: sha256(model_version + text + sorted plugin list)."""
+    content = _MODEL_VERSION + "\x00" + text + "\x00" + ",".join(sorted(plugins))
     return "analysis:" + hashlib.sha256(content.encode()).hexdigest()
 
 
@@ -428,7 +434,17 @@ def health():
 
 @api_bp.route("/ready", methods=["GET"])
 def ready():
-    """200 only if plugins are loaded and ready to serve."""
+    """
+    Readiness probe.
+
+    [C-09/C-10/C-11 FIX] Beyond "are plugins registered?", verify their heavy
+    backends actually loaded:
+      - 503 if no plugins, OR if any *core* engine (the AI detector) failed to load.
+      - 200 "ready_degraded" if a non-core plugin's backend is down (service still
+        usable, but the client is told which signals are missing).
+    The previous version returned 200 whenever len(registry)>0, masking a detector
+    that silently failed to load.
+    """
     registry = current_app.config.get("PLUGIN_REGISTRY")
     if registry is None or len(registry) == 0:
         return jsonify({
@@ -436,11 +452,26 @@ def ready():
             "reason": "No plugins loaded",
         }), 503
 
-    return jsonify({
-        "status": "ready",
+    health = registry.health_report()
+    degraded = sorted(n for n, ok in health.items() if not ok)
+    core_down = registry.core_unhealthy()
+
+    if core_down:
+        return jsonify({
+            "status": "not_ready",
+            "reason": f"Core engine(s) failed to load: {', '.join(sorted(core_down))}",
+            "engine_status": health,
+        }), 503
+
+    body = {
+        "status": "ready_degraded" if degraded else "ready",
         "plugins_loaded": len(registry),
         "plugins": registry.list_plugins(),
-    }), 200
+        "engine_status": health,
+    }
+    if degraded:
+        body["degraded_plugins"] = degraded
+    return jsonify(body), 200
 
 
 # ═══════════════════════════════════════════════════════════════════

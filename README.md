@@ -93,8 +93,268 @@ The tokenizer and config are loaded from the local HuggingFace cache (`answerdot
 | `citation_check` | Verifies citations against CrossRef, Semantic Scholar, and OpenAlex. Detects fabricated references. |
 | `watermark_detection` | Detects statistical watermarks embedded in text by AI models. |
 | `zone_classifier` | Classifies text zones (direct quotes, paraphrases, original content). Detects citation style (APA/MLA/IEEE/Chicago/Vancouver/Harvard), coverage, and consistency. No network calls. |
+| `author_signature` | Intra-document authorship **consistency**. Splits the text into chunks and measures style dispersion — flags sections spliced from a different author/AI. Localization aid, not a verdict. |
+| `discourse_structure` | **Argumentative-structure uniformity** (model-agnostic). Detects templated discourse: even paragraphs, formal connectives, enumeration/closing scaffolding. Survives paraphrasing. |
+| `semantic_consistency` | **Internal-contradiction detection** (model-agnostic). Flags sentences that contradict each other (negation flips, numeric mismatches; optional NLI). |
 | `forensic_report` | Generates a full HTML forensic report via `ForensicReportGenerator`. Requires `full_analysis` pipeline. |
-| `full_analysis` | Complete pipeline: detection → stylometric → hallucination → reasoning → perplexity → segment → citation → watermark → forensic report. |
+| `full_analysis` | Complete pipeline: detection → stylometric → hallucination → reasoning → perplexity → segment → citation → author/discourse/semantic → **late fusion verdict** → forensic report. |
+
+### 🎓 Guía para profesores — ¿IA o Humano? Qué mide cada plugin (explicación dummie)
+
+> **Cómo leer esto.** Ningún plugin decide solo. El servicio combina todas las señales en un
+> **veredicto de fusión** (`fusion`). **Importante y honesto:** el clasificador neuronal base
+> es de **2023**; reconoce muy bien modelos de esa época, pero es *parcialmente ciego* a
+> modelos de frontera nuevos (GPT‑5, Claude 4, Gemini 2, DeepSeek‑R1) salvo reentrenamiento.
+> Por eso añadimos señales **model‑agnósticas** (estructura, contradicciones, citas) que
+> funcionan sin importar qué modelo escribió el texto. **Regla de oro: usa el veredicto como
+> apoyo, nunca como prueba única — pide siempre evidencia (citas, contradicciones, secciones).**
+
+#### Plantilla curl (todo de una vez — lo recomendado para evaluar)
+
+```bash
+curl -X POST http://localhost:5006/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Pega aquí el texto del estudiante...",
+    "plugins": ["full_analysis"]
+  }'
+```
+
+`full_analysis` corre TODO y devuelve, además del veredicto neuronal, la `fusion`
+(veredicto combinado) y las señales `author_signature`, `discourse_structure` y
+`semantic_consistency`. Si quieres una sola señal, pásala sola en `plugins`.
+
+---
+
+#### 1. `ai_detection` — el detector neuronal (la "primera opinión")
+
+- **Qué hace (dummie):** un modelo entrenado lee el texto y estima qué porcentaje "huele" a
+  escrito por IA. Es la huella estadística del estilo de escritura.
+- **Cómo leerlo:** `ai_percentage` alto (>70) → sospecha de IA; `human_percentage` alto →
+  sospecha de humano. **Pero mira siempre `uncertainty_zone` y `ensemble_disagreement`**: si
+  el modelo "duda" (desacuerdo alto entre sus 3 sub‑modelos), el porcentaje NO es confiable.
+- **Limitación clave:** modelo 2023 → puede fallar con IA de 2025‑2026. No te quedes solo con esto.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["ai_detection"]}'
+```
+```jsonc
+"data": {
+  "prediction": "AI", "ai_percentage": 87.3, "human_percentage": 12.7,
+  "uncertainty_zone": false,        // true = el modelo NO está seguro → no te fíes del %
+  "ensemble_disagreement": 3.1,     // 0 = los 3 sub-modelos coinciden; >12 = dudan mucho (texto raro/nuevo)
+  "detected_model": "gpt4o"         // a qué modelo se parece (orientativo, NO prueba autoría)
+}
+```
+
+#### 2. `segment_analysis` — mapa de calor párrafo a párrafo
+
+- **Qué hace (dummie):** en vez de un número global, pinta CADA párrafo como IA o Humano. Sirve
+  para detectar tareas **mezcladas** (el alumno escribió algo y pegó otro trozo de ChatGPT).
+- **Cómo leerlo:** mira `paragraph_scores`. Si todos son IA → documento uniforme. Si saltan
+  (humano, humano, IA, humano) → **mezcla**; `breakpoint_count` alto = muchos saltos.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["segment_analysis"]}'
+```
+
+#### 3. `perplexity_check` — qué tan "predecible" es el texto
+
+- **Qué hace (dummie):** la IA tiende a elegir la palabra "más probable" todo el tiempo, así que
+  su texto es **demasiado fluido/predecible**. Los humanos sorprenden más (la "burstiness").
+- **Cómo leerlo:** `ai_score` alto / `risk_level` HIGH → texto muy predecible (señal de IA).
+- **Limitación:** los "humanizadores" rompen esta señal a propósito → úsala como apoyo.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["perplexity_check"]}'
+```
+
+#### 4. `stylometric_analysis` — la "huella de escritura"
+
+- **Qué hace (dummie):** mide largo de frases, riqueza de vocabulario, uso de comas, variabilidad.
+  La IA suele escribir frases de largo muy parejo y vocabulario "correcto pero plano".
+- **Cómo leerlo:** baja `burstiness` (poca variación de frase) + alta uniformidad → más IA.
+  Vocabulario muy rico y frases variadas → más humano.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["stylometric_analysis"]}'
+```
+
+#### 5. `hallucination_check` — ¿se inventa cosas o se contradice?
+
+- **Qué hace (dummie):** busca "inventos" típicos de IA: afirmaciones vagas, datos que derivan,
+  incoherencias internas. La IA suena segura aunque diga algo incoherente.
+- **Cómo leerlo:** `risk_level` HIGH + `overall_risk` alto → texto con marcas de fabricación.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["hallucination_check"]}'
+```
+
+#### 6. `reasoning_check` — ¿parece un modelo "que razona" (o1, R1)?
+
+- **Qué hace (dummie):** detecta el estilo de los modelos de razonamiento: "pensemos paso a paso",
+  retrocesos ("espera, reconsideremos"), andamiaje de cadena‑de‑pensamiento.
+- **Cómo leerlo:** `ai_score` alto → patrones de modelo razonador. Útil contra DeepSeek‑R1/o1.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["reasoning_check"]}'
+```
+
+#### 7. `citation_check` — ¿las referencias EXISTEN de verdad? (la prueba más fuerte)
+
+- **Qué hace (dummie):** toma las citas/bibliografía y las **verifica** contra bases reales
+  (CrossRef, Semantic Scholar, OpenAlex). La IA **fabrica** referencias que parecen reales.
+- **Cómo leerlo:** referencias `fabricated` (no existen) o `chimeric` (mezcla autores/título) →
+  **evidencia fuerte** de IA. Esto es lo más defendible ante un comité.
+- **Nota:** requiere red (`ENABLE_REFERENCE_CHECK=1`).
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"... según Smith (2021)...\n\nReferencias\nSmith, J. (2021)...","plugins":["citation_check"]}'
+```
+
+#### 8. `zone_classifier` — estilo de citación y cobertura (sin red)
+
+- **Qué hace (dummie):** detecta el estilo (APA/MLA/IEEE…), si las citas del texto tienen
+  entrada en la bibliografía, y marca "citas huérfanas". No usa internet.
+- **Cómo leerlo:** baja `citation_coverage` o muchas `orphan_citations` → descuido o fabricación.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["zone_classifier"]}'
+```
+
+#### 9. `author_signature` — ¿lo escribió UNA sola mano? (detecta mezclas)
+
+- **Qué hace (dummie):** parte el texto en trozos y compara su "estilo". Si todos los trozos
+  escriben igual → un solo autor. Si un trozo se desvía → posible **sección pegada de IA**.
+- **Cómo leerlo:** `consistency_score` cerca de 1 = estilo uniforme (NO prueba IA — un humano
+  formal también es uniforme). `outlier_count` > 0 → mira `outliers` para ver QUÉ sección difiere.
+- **Para qué te sirve:** localizar el trozo sospechoso, no dar veredicto.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["author_signature"]}'
+```
+```jsonc
+"data": {
+  "consistency_score": 0.82,                 // ~1 = un solo estilo; bajo = estilos mezclados
+  "consistency_level": "HIGH CONSISTENCY — single coherent author",
+  "outlier_count": 1,                         // nº de trozos que se salen del estilo
+  "outliers": [{"chunk_index": 3, "rms_zscore": 2.4, "text_preview": "..."}]  // QUÉ trozo difiere
+}
+```
+
+#### 10. `discourse_structure` — ¿estructura "de plantilla"? (model‑agnóstico, sobrevive a paráfrasis)
+
+- **Qué hace (dummie):** mide si el texto está "demasiado ordenado": párrafos del mismo tamaño,
+  muchos "Además / Sin embargo / En conclusión", listas "Primero… Segundo… Finalmente". La IA
+  ama esta plantilla. **Lo mejor:** parafrasear no la borra (la estructura se mantiene).
+- **Cómo leerlo:** `uniformity` alto (>0.55) → estructura muy templada (típico IA). Bajo (<0.3)
+  → escritura orgánica/espontánea (típico humano). Es un **indicio**, no veredicto: un alumno
+  ordenado también puntúa medio.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["discourse_structure"]}'
+```
+```jsonc
+"data": {
+  "uniformity": 0.61,                         // 0 = caótico/humano, 1 = plantilla/IA
+  "level": "HIGH — strongly templated structure",
+  "features": {                               // el desglose de POR QUÉ
+    "connective_density": 0.8,                // muchos "however/moreover/furthermore"
+    "paragraph_uniformity": 0.7,              // párrafos de tamaño muy parejo
+    "enumeration_scaffold": 0.4,              // "Firstly… Secondly… Finally…"
+    "opening_repetition": 0.3,                // frases que empiezan igual
+    "conclusion_marker": 1.0                  // cierre tipo "In conclusion…"
+  },
+  "evidence": {"transition_markers": ["however","moreover"], "conclusion_markers": ["in conclusion"]}
+}
+```
+
+#### 11. `semantic_consistency` — ¿el texto se contradice a sí mismo? (model‑agnóstico)
+
+- **Qué hace (dummie):** busca dónde el texto dice una cosa y luego la contraria (o da dos
+  números distintos para lo mismo). La IA, al escribir "de corrido" sin memoria global, se
+  contradice más que un humano cuidadoso.
+- **Cómo leerlo:** `contradiction_count` > 0 → revisa `contradictions` (te muestra las dos
+  frases enfrentadas). Es **evidencia para verificar a mano**, no una etiqueta automática de IA.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"Todos los participantes completaron la encuesta. ... Ninguno completó la encuesta.","plugins":["semantic_consistency"]}'
+```
+```jsonc
+"data": {
+  "contradiction_ratio": 0.2,
+  "contradiction_count": 1,
+  "contradictions": [{
+    "sentence_a": "Todos los participantes completaron la encuesta.",
+    "sentence_b": "Ninguno completó la encuesta.",
+    "reason": "negation polarity flip on shared content"   // por qué se marcó
+  }]
+}
+```
+
+#### 12. `full_analysis` — todo junto + el veredicto de FUSIÓN
+
+- **Qué hace (dummie):** corre todos los plugins y los **combina** en un único veredicto, en
+  vez de creerle solo al modelo de 2023. La fusión es **acotada**: el modelo neuronal pesa más,
+  pero las citas fabricadas, la estructura de plantilla y las contradicciones **mueven** el resultado.
+- **Cómo leerlo:**
+  - `fusion.probability` → P(IA) combinada (0–1). **`fusion.calibrated: false`** = es una
+    estimación **honesta pero NO calibrada** (aún no entrenada con datos etiquetados). Trátala
+    como "nivel de sospecha", no como probabilidad exacta.
+  - `forensic.verdict` → AI‑Generated / Human‑Written / **Hybrid** (mezcla).
+  - Compara `scores.neural` (solo modelo) vs la confianza fusionada: si difieren, los plugins
+    cambiaron la historia.
+
+```bash
+curl -X POST http://localhost:5006/analyze -H "Content-Type: application/json" \
+  -d '{"text":"...","plugins":["full_analysis"]}'
+```
+```jsonc
+"fusion": {
+  "probability": 0.71,          // sospecha combinada de IA (0–1)
+  "calibrated": false,          // ⚠ NO calibrado aún → es apoyo, no prueba
+  "source": "heuristic_fusion", // fusión heurística model-agnóstica (interina, pre-entrenamiento)
+  "features": { "neural_ai_prob": 1.0, "dsc_uniformity": 0.61, "sem_contradiction_ratio": 0.2, ... }
+},
+"forensic": { "verdict": "AI-Generated", "scores": { "neural": 1.0 } }
+```
+
+---
+
+#### 📋 Chuleta: qué valor "delata" IA vs Humano
+
+| Plugin | Campo a mirar | 🤖 Tira a IA | 🧑 Tira a Humano |
+|---|---|---|---|
+| `ai_detection` | `ai_percentage` | alto (>70) y `uncertainty_zone:false` | bajo, o `uncertainty_zone:true` (no fiable) |
+| `ai_detection` | `ensemble_disagreement` | bajo (modelo seguro) | **alto (>12)** = texto raro/nuevo → no te fíes |
+| `segment_analysis` | `paragraph_scores` | todos IA, uniforme | saltos humano/IA (mezcla) |
+| `perplexity_check` | `risk_level` | HIGH (muy predecible) | LOW (sorprende, "bursty") |
+| `stylometric_analysis` | `burstiness` | baja (frases parejas) | alta (frases variadas) |
+| `hallucination_check` | `risk_level` | HIGH (inventa/incoherente) | LOW |
+| `reasoning_check` | `ai_score` | alto (CoT, retrocesos) | bajo |
+| `citation_check` | refs `fabricated`/`chimeric` | **>0 = evidencia fuerte** | 0, todas verificadas |
+| `author_signature` | `outlier_count` | >0 (trozo pegado) | 0 (un solo estilo) |
+| `discourse_structure` | `uniformity` | alto (>0.55, plantilla) | bajo (<0.3, orgánico) |
+| `semantic_consistency` | `contradiction_count` | >0 (se contradice) | 0 (coherente) |
+| `full_analysis` | `fusion.probability` | cerca de 1 | cerca de 0 |
+
+> **Recordatorio final para el comité:** las señales **fuertes y defendibles** son las
+> verificables — **citas fabricadas** (`citation_check`), **contradicciones internas**
+> (`semantic_consistency`) y **secciones con estilo distinto** (`author_signature`). El
+> porcentaje neuronal y la perplejidad son **apoyo**, no prueba, sobre todo con IA de 2025‑2026.
+
+---
 
 ### Adding a new plugin
 
