@@ -21,6 +21,7 @@ import functools
 from typing import Any, Dict
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from app import cache, limiter
+from app.plugin_registry import adaptive_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,25 @@ api_bp = Blueprint("api", __name__)
 
 _MAX_TEXT_CHARS = 500_000  # ~125 K words; prevents OOM on oversized payloads
 _ANALYSIS_CACHE_TTL = 3600  # 1 hour — analysis of identical text+plugins reuses result
+
+# Ceiling for plugin timeouts on the SYNCHRONOUS endpoints. Long documents
+# should go through /analyze_document_async; this cap keeps sync requests
+# from outliving typical client/proxy timeouts (gunicorn default: 120 s).
+_SYNC_TIMEOUT_CAP = int(os.getenv("SYNC_PLUGIN_TIMEOUT_CAP", "100"))
+
+# Async (Celery) budget: soft limit scales with document size up to 1 hour.
+_ASYNC_SOFT_LIMIT_CAP = int(os.getenv("CELERY_SOFT_TIME_LIMIT_CAP", "3600"))
+
+
+def _plugin_timeout(word_count: int, cap: int) -> int:
+    """Document-size-aware per-plugin timeout (see plugin_registry.adaptive_timeout)."""
+    cfg = current_app.config
+    return adaptive_timeout(
+        word_count,
+        base=cfg.get("PLUGIN_TIMEOUT", 30),
+        per_kwords=cfg.get("PLUGIN_TIMEOUT_PER_KWORDS", 15.0),
+        cap=cap,
+    )
 
 # [C-16 FIX] Cache key is namespaced by model version so a model/pipeline update
 # invalidates stale results instead of serving them for up to an hour. Bump
@@ -142,9 +162,9 @@ def analyze():
 
     # ── Run plugins ───────────────────────────────────────────────
     registry = current_app.config["PLUGIN_REGISTRY"]
-    timeout = current_app.config.get("PLUGIN_TIMEOUT", 30)
 
     word_count = len(text.split())  # pre-compute once before analysis
+    timeout = _plugin_timeout(word_count, cap=_SYNC_TIMEOUT_CAP)
     results = registry.run(plugins_requested, text, timeout=timeout)
 
     elapsed = time.perf_counter() - t0
@@ -235,7 +255,7 @@ def analyze_document():
     plugins_requested = [str(p).strip().lower() for p in plugins_requested]
 
     registry = current_app.config["PLUGIN_REGISTRY"]
-    timeout = current_app.config.get("PLUGIN_TIMEOUT", 30)
+    timeout = _plugin_timeout(len(text.split()), cap=_SYNC_TIMEOUT_CAP)
 
     # ── 1. Run all requested plugins (same engine as /analyze) ────
     results = registry.run(plugins_requested, text, timeout=timeout)
@@ -308,7 +328,18 @@ def analyze_document_async():
 
     try:
         from app.tasks import analyze_document_task
-        task = analyze_document_task.delay(payload)
+        # Scale the Celery time limits with document size: the static 240/300 s
+        # decorator defaults are sized for papers, not theses. A 125 K-word
+        # document on CPU needs a proportionally larger budget; the hard limit
+        # trails the soft one so the task can still return a clean timeout error.
+        word_count = len(text.split())
+        soft_limit = _plugin_timeout(word_count, cap=_ASYNC_SOFT_LIMIT_CAP)
+        soft_limit = max(soft_limit, 240)  # never below the decorator default
+        task = analyze_document_task.apply_async(
+            args=[payload],
+            soft_time_limit=soft_limit,
+            time_limit=soft_limit + 60,
+        )
         return jsonify({"status": "accepted", "task_id": task.id}), 202
     except Exception as e:
         logger.error(f"Error enqueueing task: {e}")
@@ -389,8 +420,8 @@ def analyze_stream():
     plugins_requested = [str(p).strip().lower() for p in plugins_requested]
 
     registry = current_app.config["PLUGIN_REGISTRY"]
-    timeout = current_app.config.get("PLUGIN_TIMEOUT", 30)
     word_count = len(text.split())
+    timeout = _plugin_timeout(word_count, cap=_SYNC_TIMEOUT_CAP)
 
     def _generate():
         yield f"data: {json.dumps({'type': 'init', 'word_count': word_count, 'plugins': plugins_requested})}\n\n"

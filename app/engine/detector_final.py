@@ -727,9 +727,17 @@ def analyze_fast(text: str) -> dict:
     ]
 
     # 3. Ensemble inference — same 3-model softmax average as reference classify_text()
-    all_pcts: List[Tuple[float, float, Optional[str], float]] = []
-    for i in range(0, len(segment_id_seqs), BATCH_SIZE):
-        all_pcts.extend(_classify_batch_from_ids(segment_id_seqs[i:i + BATCH_SIZE]))
+    # Length-bucketed batching: segments are classified in ascending-length order so
+    # each batch pads to a near-uniform length instead of the batch max. Mixed-length
+    # documents (short + long paragraphs) waste 30-50% of forward-pass FLOPs on pad
+    # tokens otherwise. Each segment is an independent forward pass, so scores are
+    # bit-identical; results are written back at their original index.
+    order = sorted(range(len(segment_id_seqs)), key=lambda i: len(segment_id_seqs[i]))
+    all_pcts: List[Optional[Tuple[float, float, Optional[str], float]]] = [None] * len(segment_id_seqs)
+    for i in range(0, len(order), BATCH_SIZE):
+        bucket = order[i:i + BATCH_SIZE]
+        for seg_idx, pcts in zip(bucket, _classify_batch_from_ids([segment_id_seqs[j] for j in bucket])):
+            all_pcts[seg_idx] = pcts
 
     # 4. Per-segment results + token-weighted aggregate
     segments = []

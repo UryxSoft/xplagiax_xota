@@ -250,9 +250,10 @@ class PluginOrchestrator:
         if cfg.enable_hybrid_segment:
             try:
                 from hybrid_segment_detector import HybridSegmentAnalyzer
-                from detector_final import classify_segment
+                from detector_final import classify_batch, classify_segment
                 self._hybrid_analyzer = HybridSegmentAnalyzer(
                     classify_fn=classify_segment,
+                    classify_batch_fn=classify_batch,
                 )
                 logger.info("HybridSegmentAnalyzer loaded")
             except ImportError as exc:

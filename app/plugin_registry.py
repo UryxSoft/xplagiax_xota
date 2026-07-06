@@ -25,6 +25,25 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def adaptive_timeout(
+    word_count: int,
+    base: int = 30,
+    per_kwords: float = 15.0,
+    cap: int = 3600,
+) -> int:
+    """Per-plugin timeout scaled to document size.
+
+    A fixed timeout sized for abstracts (30 s) silently breaks thesis-sized
+    inputs: the future times out, the result is discarded, but the plugin
+    thread keeps running the full CPU-bound inference anyway — worst of both
+    worlds. Short texts keep `base`; every 1 000 words adds `per_kwords`
+    seconds (CPU ensemble budget); `cap` bounds the total (sync callers pass
+    a low cap, Celery passes one under its own soft time limit).
+    """
+    scaled = base + (max(0, word_count) / 1000.0) * per_kwords
+    return int(min(cap, max(base, scaled)))
+
+
 class PluginRegistry:
     """Thread-safe registry of analysis plugins."""
 
