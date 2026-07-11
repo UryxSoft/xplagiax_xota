@@ -469,13 +469,28 @@ class PluginOrchestrator:
                 logger.warning("WatermarkDecoder.detect() failed: %s", exc)
 
         # ── Tier-1 model-agnostic signals (feed the fusion + reported standalone) ──
-        if self.config.enable_author_signature and self._stylometric is not None:
+        # Authorship consistency: embedding engine (LUAR, opt-in via
+        # ENABLE_AUTHOR_EMBEDDING=1 — see docs/sota/D_AUTHOR_SIGNATURE.md) with
+        # fallback to the stylometric implementation. Both emit `outlier_ratio`,
+        # so the fusion feature is source-agnostic.
+        if self.config.enable_author_signature:
+            _authsig_done = False
             try:
-                from authorship_consistency import compute_authorship_consistency
-                additional["author_signature"] = compute_authorship_consistency(
-                    self._stylometric, text)
+                import author_embedding
+                if author_embedding.is_available():
+                    _authsig = author_embedding.analyze_document(text)
+                    if _authsig.get("status") == "ok":
+                        additional["author_signature"] = _authsig
+                        _authsig_done = True
             except Exception as exc:
-                logger.warning("authorship_consistency failed: %s", exc)
+                logger.warning("author embedding failed: %s", exc)
+            if not _authsig_done and self._stylometric is not None:
+                try:
+                    from authorship_consistency import compute_authorship_consistency
+                    additional["author_signature"] = compute_authorship_consistency(
+                        self._stylometric, text)
+                except Exception as exc:
+                    logger.warning("authorship_consistency failed: %s", exc)
 
         if self._discourse_analyzer is not None:
             try:

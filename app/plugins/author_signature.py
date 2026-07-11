@@ -28,6 +28,15 @@ logger = logging.getLogger(__name__)
 _profiler = None
 _available = False
 
+# Preferred implementation: authorship embeddings (LUAR — opt-in via
+# ENABLE_AUTHOR_EMBEDDING=1, see docs/sota/D_AUTHOR_SIGNATURE.md). Falls back
+# to the stylometric z-dispersion implementation below when not enabled.
+_embedding_engine = None
+try:
+    from app.engine import author_embedding as _embedding_engine
+except Exception as exc:  # noqa: BLE001
+    logger.debug("author_embedding module not importable: %s", exc)
+
 try:
     from app.engine.stylometric_profiler import StylometricProfiler
     from app.engine.authorship_consistency import compute_authorship_consistency
@@ -44,16 +53,28 @@ class AuthorSignaturePlugin(BasePlugin):
         return "author_signature"
 
     def health(self) -> bool:
+        if _embedding_engine is not None and _embedding_engine.is_available():
+            return True
         return _available
 
     def description(self) -> str:
         return (
-            "Intra-document authorship-consistency profile (reuses StylometricProfiler "
-            "feature extraction). High consistency = single coherent author; outlier chunks "
-            "flag possible mixed/AI-spliced sections. Localization aid, not a verdict."
+            "Intra-document authorship-consistency profile (authorship embeddings when "
+            "ENABLE_AUTHOR_EMBEDDING=1, else StylometricProfiler dispersion). High "
+            "consistency = single coherent author; outlier chunks flag possible "
+            "mixed/AI-spliced sections. Localization aid, not a verdict."
         )
 
     def analyze(self, text: str) -> Dict[str, Any]:
+        if _embedding_engine is not None and _embedding_engine.is_available():
+            try:
+                result = _embedding_engine.analyze_document(text)
+                if result.get("status") == "ok":
+                    return result
+                logger.warning("author embedding returned %s — falling back",
+                               result.get("status"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("author embedding failed (%s) — falling back", exc)
         if not _available or _profiler is None:
             return {"error": "StylometricProfiler not loaded."}
         return compute_authorship_consistency(_profiler, text)
