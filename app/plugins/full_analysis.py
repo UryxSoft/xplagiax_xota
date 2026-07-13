@@ -3,7 +3,7 @@ app/plugins/full_analysis.py — Complete XplagiaX forensic pipeline.
 
 Wraps PluginOrchestrator.run() to execute all enabled analyses:
     ModernBERT detection → Stylometric → Hallucination → Reasoning →
-    Perplexity → Hybrid Segment → Reference Validation → Watermark →
+    Perplexity → Hybrid Segment → Watermark →
     Forensic Report Generation
 
 Returns the full forensic report as JSON + optionally HTML.
@@ -59,8 +59,6 @@ try:
         enable_reasoning=True,
         enable_perplexity=True,
         enable_hybrid_segment=True,
-        enable_reference_check=os.getenv("ENABLE_REFERENCE_CHECK", "0") == "1",
-        reference_network=os.getenv("REFERENCE_NETWORK", "1") == "1",
         enable_watermark=os.getenv("ENABLE_WATERMARK", "0") == "1",
         enable_forensic_report=True,
         forensic_output_format="html",
@@ -87,7 +85,7 @@ class FullAnalysisPlugin(BasePlugin):
         return (
             "Complete XplagiaX forensic pipeline: ModernBERT detection, "
             "stylometric, hallucination, reasoning, perplexity, segment heatmap, "
-            "citation validation, watermark, and forensic report generation."
+            "watermark, and forensic report generation."
         )
 
     def analyze(self, text: str) -> Dict[str, Any]:
@@ -103,7 +101,6 @@ class FullAnalysisPlugin(BasePlugin):
                     "reasoning_profiler.py",
                     "perplexity_profiler.py",
                     "hybrid_segment_detector.py",
-                    "reference_validator.py",
                     "forensic_reports.py",
                 ],
             }
@@ -176,14 +173,6 @@ class FullAnalysisPlugin(BasePlugin):
                 "total_paragraphs": hs.get("total_paragraphs", 0),
                 "breakpoint_count": hs.get("breakpoint_count", 0),
                 "paragraph_scores": hs.get("paragraph_scores", []),
-            }
-
-        if "reference_check" in aa:
-            rc = aa["reference_check"]
-            response["citations"] = {
-                "ai_score": rc.get("ai_score", 0),
-                "risk_level": rc.get("risk_level", "N/A"),
-                "total_references": rc.get("total_references", 0),
             }
 
         # Tier-1 model-agnostic signals + the late-fusion verdict (surface verbatim).

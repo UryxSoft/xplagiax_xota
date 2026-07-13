@@ -1,5 +1,18 @@
 # Implementation: Anti-Enshittification in xplagiax_xota
 
+> **STATUS: IMPLEMENTED** — the changes below shipped with these deltas from the original plan:
+>
+> | Plan | Shipped as |
+> |---|---|
+> | `app/plugins/model_drift_detector.py` (plugin) | `app/engine/drift_monitor.py` (engine singleton — a BasePlugin's `analyze(text)` contract never fit a monitor). Wired into `ai_detection`; exposed at `GET /api/drift-status`. |
+> | Remove `citation_check` + `reference_validator` | Done — plugin and engine deleted; orchestrator flags removed. |
+> | Uncertainty in API responses | Done — `uncertainty {margin_pct, ensemble_std_pct, in_uncertain_zone}`, `model_version`, `warning` in `ai_detection` data and top-level `/analyze` + `/analyze_document`. |
+> | Archive dead code | Done — `app/engine/legacy.py` ([C9]). |
+> | Versioning + fallback | Done — `MODEL_FALLBACK_DIR` fallback in `_load_model()`, `get_model_info()`, `scripts/retrain_pipeline.py` (collect/evaluate/train/promote with accuracy gate). |
+> | Extras from the audit | [C1] single engine instances (`app/engine/engines.py` + import alias finder), [C2] segment-level inference LRU, [C6] shared plugin executor + BLAS caps, [C8] global request deadline. |
+>
+> Tests: `tests/test_drift_monitor.py`, `tests/test_registry_deadline.py`, `tests/test_precision_corpus.py` (rolling-corpus gate via `ROLLING_CORPUS_DIR`).
+
 This document shows concrete code changes to implement safeguards against service degradation.
 
 ## Change 1: Hook ModelDriftDetector into plugin_orchestrator.py

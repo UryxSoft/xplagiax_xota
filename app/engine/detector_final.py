@@ -36,7 +36,9 @@ except ImportError:
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-model1_path = os.path.join(_BASE_DIR, "modernbert.bin")
+# XPLAGIAX_EVAL_WEIGHTS: candidate-weights override used by
+# scripts/retrain_pipeline.py evaluate — never set it in production serving.
+model1_path = os.getenv("XPLAGIAX_EVAL_WEIGHTS") or os.path.join(_BASE_DIR, "modernbert.bin")
 model2_path = os.path.join(_BASE_DIR, "Model_groups_3class_seed12")
 model3_path = os.path.join(_BASE_DIR, "Model_groups_3class_seed22")
 #model4_path = os.path.join(_BASE_DIR, "Model_groups_41class_seed44__new")
@@ -50,10 +52,45 @@ tokenizer = AutoTokenizer.from_pretrained(
     "answerdotai/ModernBERT-base", local_files_only=True
 )
 
+# ── Model load bookkeeping (weight versioning / fallback) ─────────
+# Populated by _load_model(); surfaced via get_model_info() and /api/drift-status
+# so operators can see exactly which weight files each worker is serving.
+_MODEL_LOAD_INFO: List[Dict[str, object]] = []
+
+
 # ── Helper: arquitectura vacía + pesos locales, 0 descargas ──
 def _load_model(weight_path):
+    """Build the architecture and load local weights, with optional fallback.
+
+    If the primary weight file is missing or corrupt and MODEL_FALLBACK_DIR is
+    set, the same basename is loaded from that directory instead (the "last
+    known good" weights kept by scripts/retrain_pipeline.py promote step). The
+    fallback is recorded so /api/drift-status can surface that the worker is
+    running on old weights rather than silently serving them as current.
+    """
     m = AutoModelForSequenceClassification.from_config(_config)
-    m.load_state_dict(torch.load(weight_path, map_location=device))
+    loaded_from = weight_path
+    used_fallback = False
+    try:
+        state = torch.load(weight_path, map_location=device)
+    except Exception as primary_err:
+        fallback_dir = os.getenv("MODEL_FALLBACK_DIR", "")
+        if not fallback_dir:
+            raise
+        fallback_path = os.path.join(fallback_dir, os.path.basename(weight_path))
+        logger.error(
+            "Primary weights unusable (%s): %s — falling back to %s",
+            weight_path, primary_err, fallback_path,
+        )
+        state = torch.load(fallback_path, map_location=device)
+        loaded_from = fallback_path
+        used_fallback = True
+    m.load_state_dict(state)
+    _MODEL_LOAD_INFO.append({
+        "requested": os.path.basename(weight_path),
+        "loaded_from": loaded_from,
+        "fallback": used_fallback,
+    })
     m.to(device).eval()
     # Pin tensors in POSIX shared memory so forked Gunicorn/Celery workers read
     # the same physical pages without triggering Copy-on-Write faults.
@@ -71,6 +108,18 @@ def _load_model(weight_path):
 model_1 = _load_model(model1_path)
 model_2 = _load_model(model2_path)
 model_3 = _load_model(model3_path)
+
+
+def get_model_info() -> Dict[str, object]:
+    """Weight provenance + version for /api/drift-status and diagnostics."""
+    return {
+        "version": os.getenv("MODEL_VERSION", "2026.06"),
+        "device": str(device),
+        "weights": list(_MODEL_LOAD_INFO),
+        "fallbacks_used": [
+            i["loaded_from"] for i in _MODEL_LOAD_INFO if i.get("fallback")
+        ],
+    }
 #model_4 = AutoModelForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=41)
 #model_4.load_state_dict(torch.hub.load_state_dict_from_url(model4_path, map_location=device))
 #model_4.to(device).eval()
@@ -272,46 +321,85 @@ def _gradio_classify(text: str):
 # Reuses the 4 already-loaded models — NO extra memory.
 # Returns (human_percentage, ai_percentage) as a simple tuple.
 
+# ── [C2] Segment-level inference cache ────────────────────────────
+# classify_batch() is the shared entry point for the hybrid window classifier,
+# classify_segment(), and any chunked caller. The SAME window/segment text is
+# often scored several times per request (e.g. the segment_analysis plugin and
+# the full_analysis orchestrator walking the same document), and repeatedly
+# across near-identical requests. Each entry is two floats, so the cache tops
+# out at a few hundred KB. Namespaced by _CACHE_NS: a model swap invalidates it.
+import threading as _threading
+from collections import OrderedDict as _OrderedDict
+
+_SEG_CACHE: "_OrderedDict[str, Tuple[float, float]]" = _OrderedDict()
+_SEG_CACHE_LOCK = _threading.Lock()
+_SEG_CACHE_MAX = int(os.getenv("SEGMENT_CACHE_MAX", "2048"))
+
+
 @torch.inference_mode()
 def classify_batch(texts: List[str]) -> List[Tuple[float, float]]:
     """
     Clasifica una lista de segmentos en un solo lote (batch).
     Es mucho más rápido que procesar uno por uno.
+
+    [C2] Segment results are memoised in a bounded LRU keyed by the cleaned
+    text, so only cache MISSES reach the 3-model ensemble. Scores for misses
+    are numerically identical to the uncached path (same tokenization, same
+    softmax average).
     """
     if not texts:
         return []
-        
+
     cleaned_texts = [clean_text(t) for t in texts]
+    keys = [
+        _CACHE_NS + ":" + _hashlib.sha1(t.encode("utf-8")).hexdigest()
+        for t in cleaned_texts
+    ]
 
-    # max_length makes truncation explicit — avoids silent loss of content
-    inputs = tokenizer(
-        cleaned_texts,
-        return_tensors="pt",
-        truncation=True,
-        padding=True,
-        max_length=tokenizer.model_max_length,
-    ).to(device)
+    results: List[Optional[Tuple[float, float]]] = [None] * len(texts)
+    with _SEG_CACHE_LOCK:
+        for i, key in enumerate(keys):
+            hit = _SEG_CACHE.get(key)
+            if hit is not None:
+                _SEG_CACHE.move_to_end(key)
+                results[i] = hit
 
-    # Inferencia del ensamble en paralelo
-    logits_1 = model_1(**inputs).logits
-    logits_2 = model_2(**inputs).logits
-    logits_3 = model_3(**inputs).logits
-    
-    # Promediar probabilidades del lote
-    avg_probs = (
-        torch.softmax(logits_1, dim=1)
-        + torch.softmax(logits_2, dim=1)
-        + torch.softmax(logits_3, dim=1)
-    ) / 3
-    
-    results = []
-    for i in range(len(texts)):
-        probs = avg_probs[i]
-        human_prob = probs[24].item()
-        ai_prob = 1.0 - human_prob
-        results.append((round(human_prob * 100), round(ai_prob * 100)))
-        
-    return results
+    miss_idx = [i for i, r in enumerate(results) if r is None]
+    if miss_idx:
+        miss_texts = [cleaned_texts[i] for i in miss_idx]
+
+        # max_length makes truncation explicit — avoids silent loss of content
+        inputs = tokenizer(
+            miss_texts,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=tokenizer.model_max_length,
+        ).to(device)
+
+        # Inferencia del ensamble en paralelo
+        logits_1 = model_1(**inputs).logits
+        logits_2 = model_2(**inputs).logits
+        logits_3 = model_3(**inputs).logits
+
+        # Promediar probabilidades del lote
+        avg_probs = (
+            torch.softmax(logits_1, dim=1)
+            + torch.softmax(logits_2, dim=1)
+            + torch.softmax(logits_3, dim=1)
+        ) / 3
+
+        with _SEG_CACHE_LOCK:
+            for j, i in enumerate(miss_idx):
+                human_prob = avg_probs[j][24].item()
+                pair = (round(human_prob * 100), round((1.0 - human_prob) * 100))
+                results[i] = pair
+                _SEG_CACHE[keys[i]] = pair
+                _SEG_CACHE.move_to_end(keys[i])
+            while len(_SEG_CACHE) > _SEG_CACHE_MAX:
+                _SEG_CACHE.popitem(last=False)
+
+    return results  # every slot is filled: hit above or miss inference here
 
 
 @torch.inference_mode()
@@ -388,295 +476,6 @@ def _classify_batch_from_ids(id_seqs: List[List[int]]) -> List[Tuple[float, floa
         results.append((human_pct, ai_pct, detected_model, round(float(disagreement[i].item()), 2)))
     return results
 
-
-def validar_veredicto_segmento(segmento_dict: dict) -> dict:
-    """
-    Analiza el forensic_analysis de un segmento para confirmar o descartar
-    si realmente es IA.
-
-    Cambios v1.3 (BUG FIX):
-    ─────────────────────────────────────────────────────────────────────
-    BUG #1 CORREGIDO: El criterio de confirmación por alucinación
-    bibliográfica era incondicional: cualquier fabricated_count >= 1
-    sobreescribía el veredicto a "AI (Confirmed) 100%", incluso cuando
-    el extractor de referencias había capturado texto estructural
-    (headers de sección, alt-text de imágenes) como si fueran citas.
-
-    La corrección agrega tres condiciones de guardia:
-      1. total_references >= 2   → descartar extracciones únicas/espurias
-      2. fabricated_ratio >= 0.70 → al menos 70% de las refs son inválidas
-      3. El modelo base YA marcaba IA (label "AI" y score > 50)
-
-    Esto elimina los falsos positivos sin afectar los verdaderos positivos
-    (textos con múltiples citas inventadas confirmadas).
-    """
-    analisis = segmento_dict.get("forensic_analysis")
-    if not analisis or "error_forense" in analisis:
-        return segmento_dict
-
-    razonamiento = analisis.get("reasoning", {})
-    perplejidad  = analisis.get("perplexity", {})
-    referencias  = analisis.get("reference_check", {})
-
-    # [C-04 FIX] This routine used to OVERRIDE the neural verdict with hard rules:
-    # it flipped `score = 100 - score` / relabelled to "Human (Validated)", and forced
-    # `score = 100.0` / "AI (Confirmed)" on a single fabricated-citation signal. That
-    # is indefensible forensically (a weak heuristic overriding the model at 100%
-    # confidence). It is now NON-DESTRUCTIVE: it never changes `dominant_label` or
-    # `score`; it only attaches advisory annotations under `forensic_flags` that the
-    # report can surface as *supporting evidence*, not as a verdict.
-    flags = segmento_dict.setdefault("forensic_flags", [])
-
-    # ── 1. SOPORTE "HUMANO": ausencia de señales forenses de IA ───────────
-    base_score = segmento_dict.get("score", 0.0)
-    base_label = segmento_dict.get("dominant_label", "")
-    high_confidence_ai = "AI" in base_label and base_score >= 85.0
-    if (
-        razonamiento.get("ai_score", 0) < 0.25
-        and perplejidad.get("ai_score", 0) < 0.40
-        and not high_confidence_ai
-    ):
-        flags.append({
-            "type": "human_supporting",
-            "note": "Los plugins forenses no muestran señales de IA (razonamiento y "
-                    "perplejidad bajos). Soporte débil de autoría humana — no concluyente.",
-        })
-
-    # ── 2. SOPORTE "IA": alucinaciones bibliográficas ─────────────────────
-    # Guardas para evitar falsos positivos por extracción espuria de texto
-    # estructural como referencias. Sigue siendo *evidencia*, no veredicto.
-    feat_vals   = referencias.get("feature_values", {})
-    fab_count   = feat_vals.get("fabricated_count", 0)
-    total_refs  = feat_vals.get("total_references", 0)
-    fab_ratio   = feat_vals.get("fabricated_ratio", 0.0)
-
-    if (
-        fab_count > 0
-        and total_refs >= 2          # guardia (a): más de una referencia
-        and fab_ratio >= 0.70        # guardia (b): mayoría de citas inválidas
-        and "AI" in base_label       # guardia (c): el modelo base ya sospechaba IA
-        and base_score > 50.0        # guardia (c): confianza mínima en IA
-    ):
-        flags.append({
-            "type": "ai_supporting",
-            "note": "Se detectaron citas bibliográficas no verificables en múltiples "
-                    "referencias. Evidencia de soporte de generación por IA — no concluyente.",
-        })
-
-    return segmento_dict
-
-
-def analyze_long_document(long_text: str, orchestrator=None, max_tokens: int = 512) -> dict:
-    """
-    Analiza un documento completo con segmentación semántica y validación forense.
-
-    .. deprecated::
-        Use analyze_fast() for speed-optimized inference without forensic overlay,
-        or PluginOrchestrator.run() for the full forensic pipeline.
-    """
-    warnings.warn(
-        "analyze_long_document() is deprecated. Use analyze_fast() or PluginOrchestrator.run().",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    if not long_text.strip():
-        return {"error": "El documento está vacío."}
-
-    # 1. División semántica
-    if "\n" in long_text:
-        raw_fragments = [p.strip() for p in re.split(r'\n+', long_text) if p.strip()]
-    else:
-        raw_fragments = [p.strip() + "." for p in re.split(r'(?<=\.)\s+', long_text) if p.strip()]
-
-    chunks_text = []
-    current_chunk = ""
-    current_length = 0
-
-    for fragment in raw_fragments:
-        fragment_tokens = len(tokenizer.encode(fragment, add_special_tokens=False))
-        if current_length + fragment_tokens > max_tokens and current_chunk:
-            chunks_text.append(current_chunk.strip())
-            current_chunk = fragment + " "
-            current_length = fragment_tokens
-        else:
-            current_chunk += fragment + " "
-            current_length += fragment_tokens
-
-    if current_chunk.strip():
-        chunks_text.append(current_chunk.strip())
-
-    # Fusión de fragmentos cortos al final
-    if len(chunks_text) > 1:
-        last_tokens = len(tokenizer.encode(chunks_text[-1], add_special_tokens=False))
-        if last_tokens < 50:
-            chunks_text[-2] += " " + chunks_text.pop()
-
-    results = {"overall_summary": {}, "segments": []}
-    total_human_weighted = 0.0
-    total_ai_weighted = 0.0
-    total_tokens_processed = 0
-    
-    logger.debug("Iniciando análisis forense de %d segmentos...", len(chunks_text))
-
-    # 2. Procesamiento de Segmentos por Lotes
-    BATCH_SIZE = 8
-    for i in range(0, len(chunks_text), BATCH_SIZE):
-        batch_slice = chunks_text[i:i + BATCH_SIZE]
-        batch_results = classify_batch(batch_slice)
-        
-        for sub_idx, (human_pct, ai_pct) in enumerate(batch_results):
-            idx = i + sub_idx
-            chunk_text = batch_slice[sub_idx]
-            
-            dominant_label = "AI" if ai_pct > human_pct else "Human"
-            forensic_data = None
-            
-            # Ejecución de Plugins (Individual por segmento)
-            if orchestrator and dominant_label == "AI":
-                try:
-                    analisis_full = orchestrator.run(chunk_text)
-                    forensic_data = analisis_full.get("additional_analyses", {})
-                except Exception as e:
-                    forensic_data = {"error_forense": str(e)}
-
-            segmento_obj = {
-                "segment_id": idx + 1,
-                "text": chunk_text,
-                "dominant_label": dominant_label,
-                "score": round(max(ai_pct, human_pct)),
-                "forensic_analysis": forensic_data,
-                "status_note": None
-            }
-
-            segmento_obj = validar_veredicto_segmento(segmento_obj)
-            results["segments"].append(segmento_obj)
-            
-            # Actualización de pesos
-            final_ai_score = ai_pct if "AI" in segmento_obj["dominant_label"] else (100 - human_pct)
-            final_human_score = 100 - final_ai_score
-
-            chunk_len = len(tokenizer.encode(chunk_text, add_special_tokens=False))
-            total_human_weighted += (final_human_score * chunk_len)
-            total_ai_weighted += (final_ai_score * chunk_len)
-            total_tokens_processed += chunk_len
-
-    # 5. Resumen Final
-    if total_tokens_processed == 0:
-        return {"error": "No se pudieron procesar tokens del documento."}
-    overall_human = round(total_human_weighted / total_tokens_processed)
-    overall_ai = round(total_ai_weighted / total_tokens_processed)
-
-    results["overall_summary"] = {
-        "total_human_percentage": overall_human,
-        "total_ai_percentage": overall_ai,
-        "overall_prediction": "AI" if overall_ai > overall_human else "Human"
-    }
-
-    return results
-
-
-def analyze_long_documentsd_(long_text: str, max_tokens: int = 512) -> dict:
-    """
-    Analiza un documento dividiéndolo de forma inteligente por párrafos u oraciones,
-    evitando cortar palabras por la mitad y agrupando fragmentos cortos.
-
-    .. deprecated::
-        Use analyze_fast() — single tokenization pass, adaptive max_tokens,
-        no decode/re-encode round-trip, 2-12x faster on long documents.
-    """
-    warnings.warn(
-        "analyze_long_documentsd_() is deprecated. Use analyze_fast() instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    if not long_text.strip():
-        return {"error": "El documento está vacío."}
-
-    # 1. Dividir el texto en párrafos usando saltos de línea
-    # Si no hay saltos de línea, dividimos por puntos (oraciones)
-    if "\n" in long_text:
-        raw_fragments = [p.strip() for p in re.split(r'\n+', long_text) if p.strip()]
-    else:
-        raw_fragments = [p.strip() + "." for p in re.split(r'(?<=\.)\s+', long_text) if p.strip()]
-
-    chunks_text = []
-    current_chunk = ""
-    current_length = 0
-
-    # 2. Agrupar fragmentos inteligentemente respetando el max_tokens
-    for fragment in raw_fragments:
-        # Medir cuántos tokens tiene este fragmento
-        fragment_tokens = len(tokenizer.encode(fragment, add_special_tokens=False))
-        
-        # Si el fragmento en sí mismo es más grande que el límite (caso raro),
-        # lo forzamos a entrar, pero al menos no cortamos los demás.
-        if current_length + fragment_tokens > max_tokens and current_chunk:
-            chunks_text.append(current_chunk.strip())
-            current_chunk = fragment + " "
-            current_length = fragment_tokens
-        else:
-            current_chunk += fragment + " "
-            current_length += fragment_tokens
-
-    # Agregar el último chunk que quedó en el buffer
-    if current_chunk.strip():
-        chunks_text.append(current_chunk.strip())
-
-    # 3. Fusión del fragmento huérfano (para evitar caídas de precisión)
-    # Si el último chunk tiene muy pocos tokens (ej. menos de 50) y hay más de un chunk,
-    # lo fusionamos con el chunk anterior para darle contexto.
-    if len(chunks_text) > 1:
-        last_chunk_tokens = len(tokenizer.encode(chunks_text[-1], add_special_tokens=False))
-        if last_chunk_tokens < 50:
-            fragment_to_merge = chunks_text.pop()
-            chunks_text[-1] += " " + fragment_to_merge
-
-    results = {"overall_summary": {}, "segments": []}
-    
-    total_human_weighted = 0.0
-    total_ai_weighted = 0.0
-    total_tokens_processed = 0
-    
-    logger.debug("Iniciando análisis semántico de %d segmentos...", len(chunks_text))
-
-    # 4. Procesar por lotes
-    BATCH_SIZE = 8
-    for i in range(0, len(chunks_text), BATCH_SIZE):
-        batch_slice = chunks_text[i:i + BATCH_SIZE]
-        batch_results = classify_batch(batch_slice)
-        
-        for sub_idx, (human_pct, ai_pct) in enumerate(batch_results):
-            idx = i + sub_idx
-            chunk_text = batch_slice[sub_idx]
-            
-            dominant_label = "AI" if ai_pct > human_pct else "Human"
-            dominant_score = max(ai_pct, human_pct)
-                
-            results["segments"].append({
-                "segment_id": idx + 1,
-                "text": chunk_text,
-                "dominant_label": dominant_label,
-                "score": dominant_score
-            })
-            
-            chunk_length = len(tokenizer.encode(chunk_text, add_special_tokens=False))
-            total_human_weighted += (human_pct * chunk_length)
-            total_ai_weighted += (ai_pct * chunk_length)
-            total_tokens_processed += chunk_length
-
-    # 5. Cálculo final
-    if total_tokens_processed == 0:
-        return {"error": "No se pudieron procesar tokens del documento."}
-    overall_human = round(total_human_weighted / total_tokens_processed)
-    overall_ai = round(total_ai_weighted / total_tokens_processed)
-
-    results["overall_summary"] = {
-        "total_human_percentage": overall_human,
-        "total_ai_percentage": overall_ai,
-        "overall_prediction": "AI" if overall_ai > overall_human else "Human"
-    }
-
-    return results
 
 
 # ── Embedding / inference result cache ───────────────────────────────────────

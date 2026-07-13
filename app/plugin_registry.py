@@ -24,6 +24,25 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── [C6] Shared plugin executor ────────────────────────────────────
+# One process-wide pool instead of a fresh ThreadPoolExecutor per request.
+# Two wins:
+#   1. No thread create/teardown churn per request.
+#   2. The old `with ThreadPoolExecutor(...)` pattern called shutdown(wait=True)
+#      on exit, so a plugin that had ALREADY been reported as timed out still
+#      blocked the HTTP response until it actually finished. With a shared pool
+#      the response returns at the deadline; the stray task drains in background.
+# Size via PLUGIN_MAX_WORKERS (default 8 — ML plugins release the GIL during
+# C-level inference, so these threads genuinely run in parallel).
+_MAX_WORKERS = int(os.getenv("PLUGIN_MAX_WORKERS", "8"))
+_EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="plugin")
+
+# ── [C8] Global request deadline (seconds) ─────────────────────────
+# Upper bound on how long ONE request may wait for its plugin set, regardless
+# of how many plugins were requested. The per-plugin `timeout` still applies;
+# the effective wait is min(per-plugin timeout, REQUEST_DEADLINE_SECONDS).
+_REQUEST_DEADLINE_S = float(os.getenv("REQUEST_DEADLINE_SECONDS", "60"))
+
 
 class PluginRegistry:
     """Thread-safe registry of analysis plugins."""
@@ -89,10 +108,22 @@ class PluginRegistry:
         Execute requested plugins in parallel and return aggregated results.
 
         Returns dict: {plugin_name: {result or error}}
+
+        [C8] All plugins are submitted at once and share a single wall-clock
+        budget of min(timeout, REQUEST_DEADLINE_SECONDS). Because every plugin
+        starts at t0, waiting that budget once covers each plugin's individual
+        allowance — a slow plugin can no longer stretch the response beyond the
+        deadline, and fast plugins are collected as they finish (as_completed)
+        instead of in submission order.
+
+        [C6] Futures run on the shared module-level executor: the response
+        returns AT the deadline even if a timed-out plugin is still running
+        (previously the per-request pool's shutdown(wait=True) blocked until
+        the stray plugin finished).
         """
         results: Dict[str, Any] = {}
 
-        valid: List[tuple] = []  # (pname, plugin, t0)
+        valid: List[tuple] = []  # (pname, plugin)
         for pname in plugin_names:
             plugin = self.get(pname)
             if plugin is None:
@@ -106,44 +137,63 @@ class PluginRegistry:
         if not valid:
             return results
 
-        # P-03: cap raised to 8 — ML plugins release GIL during C-level inference,
-        # so additional threads genuinely run in parallel on multi-core machines.
-        max_workers = min(len(valid), 8)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all plugins at once so they run in parallel
-            future_to_meta: Dict[Any, tuple] = {}
-            for pname, plugin in valid:
-                t0 = time.perf_counter()
-                future_to_meta[executor.submit(plugin.analyze, text)] = (pname, t0)
+        budget = min(float(timeout), _REQUEST_DEADLINE_S)
+        t0 = time.perf_counter()
+        future_to_name: Dict[Any, str] = {
+            _EXECUTOR.submit(plugin.analyze, text): pname
+            for pname, plugin in valid
+        }
 
-            # P-07: per-plugin individual timeout — each plugin gets its full budget.
-            # A shared deadline would let a slow plugin (e.g. watermark ~15s) starve
-            # fast ones that are checked later in iteration order.
-            for future, (pname, t0) in future_to_meta.items():
+        try:
+            for future in as_completed(future_to_name, timeout=budget):
+                pname = future_to_name[future]
+                elapsed = time.perf_counter() - t0
                 try:
-                    result = future.result(timeout=timeout)
-                    elapsed = time.perf_counter() - t0
+                    result = future.result()
                     results[pname] = {
                         "status": "ok",
                         "data": result,
                         "elapsed_ms": round(elapsed * 1000, 1),
                     }
-                except FuturesTimeoutError:
-                    elapsed = time.perf_counter() - t0
-                    logger.error("Plugin '%s' timed out after %ds", pname, timeout)
-                    results[pname] = {
-                        "status": "error",
-                        "error": f"Plugin timed out after {timeout}s",
-                        "elapsed_ms": round(elapsed * 1000, 1),
-                    }
                 except Exception as exc:
-                    elapsed = time.perf_counter() - t0
                     logger.error("Plugin '%s' failed: %s", pname, exc, exc_info=True)
                     results[pname] = {
                         "status": "error",
                         "error": str(exc),
                         "elapsed_ms": round(elapsed * 1000, 1),
                     }
+        except FuturesTimeoutError:
+            pass  # deadline reached — unfinished plugins handled below
+
+        elapsed = time.perf_counter() - t0
+        for future, pname in future_to_name.items():
+            if pname in results:
+                continue
+            if future.done() and not future.cancelled():
+                # Finished in the race window between the deadline firing and
+                # this mop-up — its result is real, don't report a false timeout.
+                try:
+                    results[pname] = {
+                        "status": "ok",
+                        "data": future.result(),
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                    }
+                except Exception as exc:
+                    results[pname] = {
+                        "status": "error",
+                        "error": str(exc),
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                    }
+                continue
+            future.cancel()  # frees queue slots for plugins that never started
+            logger.error(
+                "Plugin '%s' exceeded the request budget (%.1fs)", pname, budget,
+            )
+            results[pname] = {
+                "status": "error",
+                "error": f"Plugin timed out after {budget:g}s",
+                "elapsed_ms": round(elapsed * 1000, 1),
+            }
 
         return results
 
@@ -151,6 +201,8 @@ class PluginRegistry:
         """
         Yield (plugin_name, result_dict) as each plugin completes.
         Used by /analyze_stream (SSE) to deliver results incrementally.
+
+        [C6/C8] Same shared executor + global deadline semantics as run().
         """
         # Yield errors for unknown plugins immediately
         valid: List[tuple] = []
@@ -168,39 +220,41 @@ class PluginRegistry:
         if not valid:
             return
 
-        max_workers = min(len(valid), 8)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_meta: Dict[Any, tuple] = {}
-            for pname, plugin in valid:
-                t0 = time.perf_counter()
-                future_to_meta[executor.submit(plugin.analyze, text)] = (pname, t0)
+        budget = min(float(timeout), _REQUEST_DEADLINE_S)
+        t0 = time.perf_counter()
+        future_to_name: Dict[Any, str] = {
+            _EXECUTOR.submit(plugin.analyze, text): pname
+            for pname, plugin in valid
+        }
 
-            try:
-                for future in as_completed(future_to_meta, timeout=timeout):
-                    pname, t0 = future_to_meta[future]
-                    elapsed = time.perf_counter() - t0
-                    try:
-                        result = future.result()
-                        yield pname, {
-                            "status": "ok",
-                            "data": result,
-                            "elapsed_ms": round(elapsed * 1000, 1),
-                        }
-                    except Exception as exc:
-                        logger.error("Plugin '%s' failed: %s", pname, exc, exc_info=True)
-                        yield pname, {
-                            "status": "error",
-                            "error": str(exc),
-                            "elapsed_ms": round(elapsed * 1000, 1),
-                        }
-            except FuturesTimeoutError:
-                for future, (pname, t0) in future_to_meta.items():
-                    if not future.done():
-                        logger.error("Plugin '%s' timed out after %ds", pname, timeout)
-                        yield pname, {
-                            "status": "error",
-                            "error": f"Plugin timed out after {timeout}s",
-                        }
+        try:
+            for future in as_completed(future_to_name, timeout=budget):
+                pname = future_to_name[future]
+                elapsed = time.perf_counter() - t0
+                try:
+                    result = future.result()
+                    yield pname, {
+                        "status": "ok",
+                        "data": result,
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                    }
+                except Exception as exc:
+                    logger.error("Plugin '%s' failed: %s", pname, exc, exc_info=True)
+                    yield pname, {
+                        "status": "error",
+                        "error": str(exc),
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                    }
+        except FuturesTimeoutError:
+            for future, pname in future_to_name.items():
+                if not future.done():
+                    future.cancel()
+                    logger.error("Plugin '%s' exceeded the request budget (%.1fs)",
+                                 pname, budget)
+                    yield pname, {
+                        "status": "error",
+                        "error": f"Plugin timed out after {budget:g}s",
+                    }
 
     def discover(self) -> None:
         """

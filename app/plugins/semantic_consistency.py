@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 _analyzer = None
 _available = False
 try:
-    from app.engine.semantic_consistency import SemanticConsistencyAnalyzer
-    _analyzer = SemanticConsistencyAnalyzer()
+    # [C1] Shared singleton — same instance the orchestrator (full_analysis) uses.
+    from app.engine.engines import get_semantic_analyzer
+    _analyzer = get_semantic_analyzer()
     _available = True
     logger.info("SemanticConsistencyAnalyzer loaded for semantic_consistency")
 except Exception as exc:  # noqa: BLE001 — degrade gracefully

@@ -41,6 +41,19 @@ def _analysis_cache_key(text: str, plugins: list) -> str:
     return "analysis:" + hashlib.sha256(content.encode()).hexdigest()
 
 
+def _drift_warning():
+    """'model_drift_detected' when the drift monitor flagged degradation, else None.
+
+    Computed per-response (not cached) so a degradation that starts AFTER a result
+    was cached still reaches clients. Fail-open: monitoring must never 500 the API.
+    """
+    try:
+        from app.engine.drift_monitor import get_drift_monitor
+        return "model_drift_detected" if get_drift_monitor().is_degraded() else None
+    except Exception:
+        return None
+
+
 def _merge_segment_results(results: Dict[str, Any], doc_result: Dict[str, Any]) -> None:
     """Enrich the ai_detection entry in *results* with per-segment data from *doc_result*.
 
@@ -138,6 +151,7 @@ def analyze():
     cached = cache.get(cache_key)
     if cached is not None:
         cached["from_cache"] = True
+        cached["warning"] = _drift_warning()
         return jsonify(cached)
 
     # ── Run plugins ───────────────────────────────────────────────
@@ -159,6 +173,8 @@ def analyze():
         "word_count": word_count,
         "plugins_requested": plugins_requested,
         "results": results,
+        "model_version": _MODEL_VERSION,
+        "warning": _drift_warning(),
         "total_elapsed_ms": round(elapsed * 1000, 1),
     }
     cache.set(cache_key, response_data, timeout=_ANALYSIS_CACHE_TTL)
@@ -267,6 +283,8 @@ def analyze_document():
         "word_count": word_count,
         "plugins_requested": plugins_requested,
         "results": results,
+        "model_version": _MODEL_VERSION,
+        "warning": _drift_warning(),
         "total_elapsed_ms": round(elapsed * 1000, 1),
     })
 
@@ -471,6 +489,50 @@ def ready():
     }
     if degraded:
         body["degraded_plugins"] = degraded
+    return jsonify(body), 200
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GET /api/drift-status — Model drift monitor (anti-enshittification)
+# ═══════════════════════════════════════════════════════════════════
+
+@api_bp.route("/api/drift-status", methods=["GET"])
+def drift_status():
+    """
+    Current model-quality status from the drift monitor.
+
+    Reports rolling confidence statistics, class balance, and recent alerts so
+    monitoring systems detect ensemble degradation (e.g. a new LLM family the
+    models were never trained on) BEFORE users lose trust in the verdicts.
+
+    Response JSON:
+        {
+            "status": "healthy" | "degraded" | "no_data",
+            "samples_total": 1234,
+            "window_samples": 100,
+            "mean_confidence": 0.91,
+            "baseline_confidence": 0.93,
+            "ai_share": 0.46,
+            "recent_alerts": [...],
+            "model": {"version": "...", "weights": [...], "fallbacks_used": [...]}
+        }
+
+    Unauthenticated by design (like /health and /ready) — it exposes aggregate
+    quality metrics only, never analyzed text.
+    """
+    body = {"status": "unavailable"}
+    try:
+        from app.engine.drift_monitor import get_drift_monitor
+        body = get_drift_monitor().get_status()
+    except Exception as exc:
+        logger.warning("drift-status: monitor unavailable — %s", exc)
+
+    try:
+        from app.engine.detector_final import get_model_info
+        body["model"] = get_model_info()
+    except Exception:
+        body["model"] = {"version": _MODEL_VERSION}
+
     return jsonify(body), 200
 
 
