@@ -12,7 +12,6 @@ Files in this directory:
     plugin_orchestrator.py      Pipeline coordinator
     perplexity_profiler.py      Token-level perplexity analysis
     hybrid_segment_detector.py  Per-paragraph AI/human heatmap
-    reference_validator.py      Citation existence verification
     stylometric_profiler.py     Writing style fingerprinting
     hallucination_profile.py    Fabrication risk detection
     reasoning_profiler.py       Reasoning-model detection
@@ -35,6 +34,51 @@ if _ENGINE_DIR not in sys.path:
         pkg_path = sys.modules[__name__].__path__[0]
         if pkg_path not in sys.path:
             sys.path.insert(0, pkg_path)
+
+
+# ── 1b. [C1 FIX] Canonicalize bare engine imports ─────────────────
+# The sys.path injection above makes `import detector_final` WORK, but Python
+# caches modules by name: `detector_final` and `app.engine.detector_final`
+# would be executed twice as two independent module objects. For detector_final
+# that means loading the 3-seed ModernBERT ensemble TWICE (~3.4 GB wasted) the
+# moment the orchestrator (bare imports) and a plugin (qualified imports) are
+# both active. This finder redirects any bare import of a module that lives in
+# this directory to its already-canonical `app.engine.<name>` instance, so both
+# import spellings return the SAME module object.
+import importlib
+import importlib.abc
+import importlib.util
+
+
+class _EngineAliasLoader(importlib.abc.Loader):
+    """Loader that hands back an already-imported module instead of re-executing it."""
+
+    def __init__(self, module):
+        self._module = module
+
+    def create_module(self, spec):
+        return self._module
+
+    def exec_module(self, module):  # module already executed under its canonical name
+        pass
+
+
+class _EngineAliasFinder(importlib.abc.MetaPathFinder):
+    """Meta-path finder: `import X` → alias of `app.engine.X` when X.py lives here."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if "." in fullname:
+            return None  # only bare names are aliased
+        if not os.path.isfile(os.path.join(_ENGINE_DIR, fullname + ".py")):
+            return None  # not an engine module — let the normal machinery handle it
+        canonical = importlib.import_module(f"{__name__}.{fullname}")
+        return importlib.util.spec_from_loader(
+            fullname, _EngineAliasLoader(canonical)
+        )
+
+
+if not any(isinstance(f, _EngineAliasFinder) for f in sys.meta_path):
+    sys.meta_path.insert(0, _EngineAliasFinder())
 
 import logging
 _logger = logging.getLogger(__name__)

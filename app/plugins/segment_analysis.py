@@ -16,14 +16,10 @@ _analyzer = None
 _available = False
 
 try:
-    from app.engine.hybrid_segment_detector import HybridSegmentAnalyzer
-    from app.engine.detector_final import classify_segment, classify_batch
-    # [C3] classify_batch scores all sliding windows in a few ensemble calls instead
-    # of one per window — identical scores (classify_segment already uses classify_batch).
-    _analyzer = HybridSegmentAnalyzer(
-        classify_fn=classify_segment,
-        classify_batch_fn=classify_batch,
-    )
+    # [C1] Shared singleton — same HybridSegmentAnalyzer the orchestrator uses,
+    # already wired to classify_batch ([C3]: windows scored in batched ensemble calls).
+    from app.engine.engines import get_hybrid_analyzer
+    _analyzer = get_hybrid_analyzer()
     _available = True
     logger.info("HybridSegmentAnalyzer loaded")
 except Exception as exc:

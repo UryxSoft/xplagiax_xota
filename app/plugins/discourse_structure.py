@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 _analyzer = None
 _available = False
 try:
-    from app.engine.discourse_analyzer import DiscourseAnalyzer
-    _analyzer = DiscourseAnalyzer()
+    # [C1] Shared singleton — same instance the orchestrator (full_analysis) uses.
+    from app.engine.engines import get_discourse_analyzer
+    _analyzer = get_discourse_analyzer()
     _available = True
     logger.info("DiscourseAnalyzer loaded for discourse_structure")
 except Exception as exc:  # noqa: BLE001 — degrade gracefully

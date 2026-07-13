@@ -16,8 +16,9 @@ _profiler = None
 _available = False
 
 try:
-    from app.engine.stylometric_profiler import StylometricProfiler
-    _profiler = StylometricProfiler()
+    # [C1] Shared singleton — same instance the orchestrator (full_analysis) uses.
+    from app.engine.engines import get_stylometric
+    _profiler = get_stylometric()
     _available = True
     logger.info("StylometricProfiler loaded")
 except Exception as exc:

@@ -17,9 +17,10 @@ _classifier = None
 _available = False
 
 try:
-    from app.engine.hallucination_profile import HallucinationProfiler, HallucinationRiskClassifier
-    _profiler = HallucinationProfiler()
-    _classifier = HallucinationRiskClassifier()
+    # [C1] Shared singletons — same instances the orchestrator (full_analysis) uses.
+    from app.engine.engines import get_hallucination_profiler, get_hallucination_classifier
+    _profiler = get_hallucination_profiler()
+    _classifier = get_hallucination_classifier()
     _available = True
     logger.info("HallucinationProfiler + Classifier loaded")
 except Exception as exc:
