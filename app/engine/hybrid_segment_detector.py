@@ -46,6 +46,11 @@ WINDOW_OVERLAP: float = 0.50
 MIN_WINDOW_WORDS: int = 80
 MIN_PARAGRAPH_WORDS: int = 15
 
+# [C3] Windows are classified in batches of this size when a batch classifier is
+# injected — one tokenizer+ensemble call per batch instead of one per window.
+# Bounded so a very long document does not build a single oversized padded tensor.
+WINDOW_BATCH_SIZE: int = 12
+
 THRESHOLD_AI: float = 70.0
 THRESHOLD_UNCERTAIN: float = 30.0
 
@@ -203,26 +208,61 @@ class TextSegmenter:
 
 class WindowClassifier:
 
-    def __init__(self, classify_fn: Callable[[str], Tuple[float, float]]) -> None:
+    def __init__(
+        self,
+        classify_fn: Callable[[str], Tuple[float, float]],
+        classify_batch_fn: Optional[Callable[[List[str]], List[Tuple[float, float]]]] = None,
+    ) -> None:
         self._classify_fn = classify_fn
+        # [C3] Optional batch classifier: classify_batch_fn(list[str]) -> list[(human%, ai%)].
+        # When provided, windows go through the ensemble in batches instead of one at a
+        # time. The per-window result is numerically identical (production classify_segment
+        # already delegates to classify_batch); this only removes the redundant
+        # tokenize+forward calls.
+        self._classify_batch_fn = classify_batch_fn
 
     def classify_windows(
         self, words: List[str], windows: List[Tuple[int, int]]
     ) -> List[WindowResult]:
-        results: List[WindowResult] = []
-        for idx, (start, end) in enumerate(windows):
-            window_text = " ".join(words[start:end])
-            try:
-                human_pct, ai_pct = self._classify_fn(window_text)
-            except Exception as exc:
-                logger.warning("Window %d classification failed: %s", idx, exc)
-                human_pct, ai_pct = 50.0, 50.0
+        window_texts = [" ".join(words[start:end]) for (start, end) in windows]
 
+        if self._classify_batch_fn is not None:
+            pairs = self._classify_batch(window_texts)
+        else:
+            pairs = []
+            for idx, wt in enumerate(window_texts):
+                try:
+                    pairs.append(self._classify_fn(wt))
+                except Exception as exc:
+                    logger.warning("Window %d classification failed: %s", idx, exc)
+                    pairs.append((50.0, 50.0))
+
+        results: List[WindowResult] = []
+        for idx, ((start, end), (human_pct, ai_pct)) in enumerate(zip(windows, pairs)):
             results.append(WindowResult(
                 window_index=idx, start_word=start, end_word=end,
                 human_pct=human_pct, ai_pct=ai_pct, word_count=end - start,
             ))
         return results
+
+    def _classify_batch(self, window_texts: List[str]) -> List[Tuple[float, float]]:
+        """Classify all windows in bounded batches; fall back per-batch on failure."""
+        pairs: List[Tuple[float, float]] = []
+        for i in range(0, len(window_texts), WINDOW_BATCH_SIZE):
+            chunk = window_texts[i:i + WINDOW_BATCH_SIZE]
+            try:
+                batch_pairs = self._classify_batch_fn(chunk)
+            except Exception as exc:
+                logger.warning("Batch window classification failed (%d..%d): %s",
+                               i, i + len(chunk), exc)
+                batch_pairs = [(50.0, 50.0)] * len(chunk)
+            # Guard against a batch fn returning the wrong length
+            if len(batch_pairs) != len(chunk):
+                logger.warning("Batch classifier returned %d results for %d windows; "
+                               "padding with neutral scores", len(batch_pairs), len(chunk))
+                batch_pairs = (list(batch_pairs) + [(50.0, 50.0)] * len(chunk))[:len(chunk)]
+            pairs.extend(batch_pairs)
+        return pairs
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -433,9 +473,15 @@ class HybridSegmentAnalyzer:
         heatmap  = result.to_dict()
     """
 
-    def __init__(self, classify_fn: Callable[[str], Tuple[float, float]]) -> None:
+    def __init__(
+        self,
+        classify_fn: Callable[[str], Tuple[float, float]],
+        classify_batch_fn: Optional[Callable[[List[str]], List[Tuple[float, float]]]] = None,
+    ) -> None:
         self._segmenter = TextSegmenter()
-        self._classifier = WindowClassifier(classify_fn)
+        # [C3] Pass through an optional batch classifier so all windows are scored in
+        # a few ensemble calls instead of one per window (same numbers, less latency).
+        self._classifier = WindowClassifier(classify_fn, classify_batch_fn)
         self._mapper = ParagraphMapper()
         self._bp_detector = BreakpointDetector()
         self._risk_classifier = HybridRiskClassifier()

@@ -250,9 +250,12 @@ class PluginOrchestrator:
         if cfg.enable_hybrid_segment:
             try:
                 from hybrid_segment_detector import HybridSegmentAnalyzer
-                from detector_final import classify_segment
+                from detector_final import classify_segment, classify_batch
+                # [C3] Batch all sliding windows through the ensemble in a few calls
+                # instead of one per window (same scores, lower latency).
                 self._hybrid_analyzer = HybridSegmentAnalyzer(
                     classify_fn=classify_segment,
+                    classify_batch_fn=classify_batch,
                 )
                 logger.info("HybridSegmentAnalyzer loaded")
             except ImportError as exc:
@@ -381,6 +384,26 @@ class PluginOrchestrator:
                                  ai_score, risk_level)
             except Exception as exc:
                 logger.warning("ReasoningProfiler.vectorize() failed: %s", exc)
+
+        # ── HallucinationProfiler ─────────────────────────────────────
+        # [C4 FIX] Surface the hallucination analysis in additional_analyses so the
+        # late-fusion classifier can actually consume it. Previously the profiler was
+        # only passed to ForensicReportGenerator, so fusion's hal_* features
+        # (overall_risk, category_scores) were always 0 — a signal the fusion claimed
+        # to use but never received.
+        if (self._hallucination_profiler is not None
+                and self._hallucination_classifier is not None):
+            try:
+                hal_stats = self._hallucination_profiler.compute_stats(text)
+                hal_analysis = self._hallucination_classifier.classify(hal_stats)
+                additional["hallucination"] = hal_analysis
+                logger.debug(
+                    "Hallucination: overall_risk=%.4f level=%s",
+                    hal_analysis.get("overall_risk", 0.0),
+                    hal_analysis.get("risk_level", "N/A"),
+                )
+            except Exception as exc:
+                logger.warning("HallucinationProfiler.compute_stats() failed: %s", exc)
 
         # ── PerplexityProfiler [NEW v3.7] ─────────────────────────────
         if self._perplexity_profiler is not None:

@@ -52,20 +52,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Optional spaCy — module-level fallback (overridable via DI)
 # ---------------------------------------------------------------------------
-try:
-    import spacy as _spacy
-
-    _NLP = _spacy.load("en_core_web_sm")
-    _SPACY_AVAILABLE = True
-    logger.debug("spaCy loaded — POS tagger + dependency parser active.")
-except ImportError:
-    _SPACY_AVAILABLE = False
-    _NLP = None
-    logger.debug("spaCy not installed — regex fallbacks active.")
-except OSError:
-    _SPACY_AVAILABLE = False
-    _NLP = None
-    logger.debug("spaCy model not found — regex fallbacks active.")
+# [C7 FIX] Share the single spaCy pipeline (see app/engine/_nlp.py). Previously this
+# module and hallucination_profile.py each loaded their own en_core_web_sm copy.
+from app.engine._nlp import get_nlp as _get_nlp, spacy_available as _spacy_available
+_NLP = _get_nlp()
+_SPACY_AVAILABLE = _spacy_available()
+if _SPACY_AVAILABLE:
+    logger.debug("spaCy loaded (shared) — POS tagger + dependency parser active.")
+else:
+    logger.debug("spaCy unavailable — regex fallbacks active.")
 
 
 # ---------------------------------------------------------------------------

@@ -17,8 +17,13 @@ _available = False
 
 try:
     from app.engine.hybrid_segment_detector import HybridSegmentAnalyzer
-    from app.engine.detector_final import classify_segment
-    _analyzer = HybridSegmentAnalyzer(classify_fn=classify_segment)
+    from app.engine.detector_final import classify_segment, classify_batch
+    # [C3] classify_batch scores all sliding windows in a few ensemble calls instead
+    # of one per window — identical scores (classify_segment already uses classify_batch).
+    _analyzer = HybridSegmentAnalyzer(
+        classify_fn=classify_segment,
+        classify_batch_fn=classify_batch,
+    )
     _available = True
     logger.info("HybridSegmentAnalyzer loaded")
 except Exception as exc:
