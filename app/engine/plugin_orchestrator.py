@@ -518,6 +518,7 @@ class PluginOrchestrator:
 
         # ── ForensicReportGenerator ───────────────────────────────────
         forensic_report = None
+        forensic_report_path = None
         if self._forensic_generator is not None:
             try:
                 forensic_report = self._forensic_generator.generate_report(
@@ -526,11 +527,15 @@ class PluginOrchestrator:
                     additional_analyses=additional,
                     generate_visuals=True,
                 )
-                path = self.config.forensic_output_path
+                # Unique path per run. The orchestrator is a singleton, so the fixed
+                # config.forensic_output_path let concurrent requests race on the same
+                # file; each run now writes its own path (threaded out via the result).
+                path = _unique_report_path()
                 if self.config.forensic_output_format == "json":
                     self._forensic_generator.export_json(forensic_report, path)
                 else:
                     self._forensic_generator.export_html(forensic_report, path)
+                forensic_report_path = path
                 logger.info(
                     "Forensic report -> %s  verdict=%s  confidence=%.1f%%",
                     path, forensic_report.verdict, forensic_report.confidence * 100,
@@ -539,9 +544,10 @@ class PluginOrchestrator:
                 logger.warning("ForensicReportGenerator failed: %s", exc)
 
         return {
-            "detection_result":    detection_result,
-            "additional_analyses": additional,
-            "forensic_report":     forensic_report,
+            "detection_result":     detection_result,
+            "additional_analyses":  additional,
+            "forensic_report":      forensic_report,
+            "forensic_report_path": forensic_report_path,
         }
 
     # ── Reasoning score helpers ────────────────────────────────────────
@@ -667,7 +673,7 @@ class PluginOrchestrator:
             lines += ["", "  Forensic Report:",
                 f"    verdict={fr.verdict}  neural={fr.neural_score:.2f}  "
                 f"reasoning={fr.reasoning_score:.2f}  watermark={fr.watermark_score:.2f}",
-                f"    saved \u2192 {self.config.forensic_output_path}"]
+                f"    saved \u2192 {result.get('forensic_report_path') or self.config.forensic_output_path}"]
 
         lines += ["", f"  Active plugins: {', '.join(self.active_plugins())}", sep]
         return "\n".join(lines)

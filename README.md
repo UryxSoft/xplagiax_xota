@@ -49,6 +49,9 @@ Scientific-audit phase 1 + thesis-scale processing. Full step-by-step SOTA roadm
 | D-01 | Authorship | **Authorship-embedding engine** ([app/engine/author_embedding.py](app/engine/author_embedding.py)): LUAR-style embeddings replace hand-crafted stylometric dispersion for "did the same person write section 1 and 4?". Opt-in (`ENABLE_AUTHOR_EMBEDDING=1`), automatic fallback to stylometric path, GO/NO-GO benchmark in [scripts/benchmark_luar.py](scripts/benchmark_luar.py). | **Motor de embeddings de autoría**: embeddings tipo LUAR sustituyen la dispersión estilométrica a mano para "¿la sección 1 y la 4 son de la misma persona?". Opt-in, fallback automático al camino estilométrico, benchmark GO/NO-GO incluido. |
 | T-01 | Tier-1 | Model-agnostic signals shipped: `author_signature`, `discourse_structure`, `semantic_consistency` — survive paraphrasing, work against frontier models the 2023 ensemble never saw. | Señales model-agnósticas: `author_signature`, `discourse_structure`, `semantic_consistency` — sobreviven paráfrasis, funcionan contra modelos frontera que el ensamble 2023 nunca vio. |
 | DOC-01 | Roadmap | SOTA execution guides: [fusion training + calibration + conformal](docs/sota/A_FUSION_ENTRENADA.md), [Binoculars](docs/sota/B_BINOCULARS.md), [GROBID reference check](docs/sota/C_REFERENCE_CHECK.md), [author embeddings](docs/sota/D_AUTHOR_SIGNATURE.md), [adversarial suite + TPR@FPR=1%](docs/sota/E_SUITE_ADVERSARIAL.md). | Guías de ejecución SOTA paso a paso (A–E) en `docs/sota/`. |
+| AC-01 | Correctness | **`[CLS]`/`[SEP]` injection fix** ([detector_final.py](app/engine/detector_final.py)): `analyze_fast` fed ModernBERT content tokens with no `[CLS]` (a no-op `build_inputs_with_special_tokens`), **inverting every verdict** — known-human text scored 97% AI. Now injects `cls_token_id`/`sep_token_id` explicitly; fix propagates to fusion `neural_ai_prob` and the forensic verdict. See [AC-01](#fixes--improvements-july-2026--auditoría-científica-fase-1). | **Fix de inyección `[CLS]`/`[SEP]`**: el path `analyze_fast` alimentaba ModernBERT sin `[CLS]`, invirtiendo el veredicto — texto humano conocido daba 97% IA. Ahora inyecta los tokens especiales; corrige fusión y reporte forense. |
+| AC-02 | Reliability | Plugin registry no longer blocks the gunicorn worker past its timeout when a plugin hangs — `ThreadPoolExecutor` closed with `shutdown(wait=False, cancel_futures=True)` instead of a `with` block. | El registry de plugins ya no bloquea el worker más allá del timeout con un plugin colgado. |
+| AC-03 | Concurrency | Forensic report path is now unique per run (`_unique_report_path()`, threaded via the result dict) — concurrent `full_analysis` requests no longer race on one shared HTML file. | El path del reporte forense es único por run — requests concurrentes ya no compiten por un mismo archivo HTML. |
 
 ---
 
@@ -2180,6 +2183,25 @@ docker run -d \
 | **Total contenedor** | **~4.4 GB / 6 GB límite** |
 | Otros contenedores (MySQL, Redis, SeaweedFS, etc.) | ~1.3 GB |
 | **Disponible para el SO** | **~9 GB** |
+
+---
+
+## Fixes & Improvements (July 2026) — Auditoría Científica Fase 1
+
+### Correctness — Verdict Inversion (crítico)
+
+| ID | Problema | Fix |
+|---|---|---|
+| AC-01 | `_classify_batch_from_ids()` — el path de `analyze_fast()` que alimenta `/analyze`, `/analyze_document` y `full_analysis` — armaba el input con `tokenizer.build_inputs_with_special_tokens()`, que en el fast tokenizer de ModernBERT es **no-op**: no agrega `[CLS]`/`[SEP]`. El modelo recibía tokens de contenido sin `[CLS]`, y como la cabeza de clasificación lee la representación de `[CLS]`, el veredicto salía **invertido** — texto humano conocido (artículo de Wikipedia) puntuaba 97% IA con `detected_model=dolly`. | Inyección explícita de `cls_token_id`/`sep_token_id` alrededor de cada secuencia en [app/engine/detector_final.py](app/engine/detector_final.py). Verificado: el mismo texto pasa de 3% → 97% humano, idéntico a `tokenizer()` y al código base de referencia. La corrección se propaga al `neural_ai_prob` de la fusión (0.90 → 0.10) y al veredicto forense (AI-Generated → Human-Written). Los otros dos sitios de inferencia (`classify_text`, `classify_batch`) ya usaban `tokenizer()`, que sí agrega los especiales — no estaban afectados. |
+
+### Reliability & Concurrency
+
+| ID | Problema | Fix |
+|---|---|---|
+| AC-02 | `PluginRegistry.run()` usaba `with ThreadPoolExecutor(...)`, cuyo `__exit__` llama `shutdown(wait=True)`. Eso **re-bloqueaba hasta que TODOS los hilos de plugin terminaran**, incluso los ya reportados como timed-out — un plugin colgado ataba el worker de gunicorn indefinidamente, pasando el timeout anunciado. `run_stream()` no tenía el problema (usa `as_completed(timeout=)`), quedando inconsistente. | Ciclo de vida explícito con `try/finally` + `shutdown(wait=False, cancel_futures=True)` en [app/plugin_registry.py](app/plugin_registry.py). `run()` retorna al vencer el timeout; el hilo colgado sigue en background sin bloquear el request. Verificado: con un plugin de 30 s y `timeout=2 s`, `run()` retorna en 2.08 s. |
+| AC-03 | `PluginOrchestrator` es singleton, así que `config.forensic_output_path` (fijo) hacía que requests concurrentes de `full_analysis` escribieran **el mismo archivo HTML** del reporte forense — race condition en disco. | Path único por run vía `_unique_report_path()`, propagado en el dict de resultado como `forensic_report_path` y leído por `summary()`. [app/engine/plugin_orchestrator.py](app/engine/plugin_orchestrator.py). La respuesta del API ya usaba su propio `NamedTemporaryFile`, así que este era un side-write redundante y racy; ahora es único. |
+
+> **Ningún plugin fue eliminado ni desactivado.** Los cambios tocan solo el mecanismo de timeout del thread pool y el path del reporte. Análisis que aparecen como `inconclusive` en textos cortos (`author_signature`, `discourse_structure`, `semantic_consistency`, `segment_analysis`) se saltan por longitud mínima (≥3 chunks / ≥4 oraciones), no por eliminación; `watermark` y `reference_check` se controlan por `ENABLE_WATERMARK` / `ENABLE_REFERENCE_CHECK`.
 
 ---
 

@@ -128,7 +128,13 @@ class PluginRegistry:
         # P-03: cap raised to 8 — ML plugins release GIL during C-level inference,
         # so additional threads genuinely run in parallel on multi-core machines.
         max_workers = min(len(valid), 8)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Explicit lifecycle instead of `with`: ThreadPoolExecutor.__exit__ calls
+        # shutdown(wait=True), which re-blocks until every plugin thread finishes —
+        # even ones already reported as timed out — tying the gunicorn worker to a
+        # hung plugin indefinitely, past the advertised timeout. shutdown(wait=False)
+        # lets run() return the moment the collection loop is done.
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             # Submit all plugins at once so they run in parallel
             future_to_meta: Dict[Any, tuple] = {}
             for pname, plugin in valid:
@@ -163,6 +169,10 @@ class PluginRegistry:
                         "error": str(exc),
                         "elapsed_ms": round(elapsed * 1000, 1),
                     }
+        finally:
+            # Do NOT wait: a timed-out plugin thread keeps running in the background
+            # but must not block the request. cancel_futures drops any not-yet-started.
+            executor.shutdown(wait=False, cancel_futures=True)
 
         return results
 
