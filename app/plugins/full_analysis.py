@@ -176,7 +176,11 @@ class FullAnalysisPlugin(BasePlugin):
             }
 
         # Tier-1 model-agnostic signals + the late-fusion verdict (surface verbatim).
-        for _key in ("author_signature", "discourse_structure", "semantic_consistency", "fusion"):
+        # verdict_uncertainty carries the abstention reason when verdict == "Inconclusive"
+        # (short text / gray band / seed disagreement / code / quotes / contradictory
+        # evidence) — clients must be able to see WHY the system abstained.
+        for _key in ("author_signature", "discourse_structure", "semantic_consistency",
+                     "fusion", "verdict_uncertainty"):
             if _key in aa:
                 response[_key] = aa[_key]
 

@@ -21,6 +21,10 @@ def app():
         "PLUGIN_TIMEOUT": 5,
         "CACHE_TYPE": "SimpleCache",
         "WTF_CSRF_ENABLED": False,
+        # No Redis in CI/local test runs: an empty REDIS_URL makes /health skip
+        # the broker ping instead of returning 503 for an infra dependency the
+        # test environment deliberately doesn't have.
+        "REDIS_URL": "",
     })
     return _app
 

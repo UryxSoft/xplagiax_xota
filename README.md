@@ -52,6 +52,9 @@ Scientific-audit phase 1 + thesis-scale processing. Full step-by-step SOTA roadm
 | AC-01 | Correctness | **`[CLS]`/`[SEP]` injection fix** ([detector_final.py](app/engine/detector_final.py)): `analyze_fast` fed ModernBERT content tokens with no `[CLS]` (a no-op `build_inputs_with_special_tokens`), **inverting every verdict** — known-human text scored 97% AI. Now injects `cls_token_id`/`sep_token_id` explicitly; fix propagates to fusion `neural_ai_prob` and the forensic verdict. See [AC-01](#fixes--improvements-july-2026--auditoría-científica-fase-1). | **Fix de inyección `[CLS]`/`[SEP]`**: el path `analyze_fast` alimentaba ModernBERT sin `[CLS]`, invirtiendo el veredicto — texto humano conocido daba 97% IA. Ahora inyecta los tokens especiales; corrige fusión y reporte forense. |
 | AC-02 | Reliability | Plugin registry no longer blocks the gunicorn worker past its timeout when a plugin hangs — `ThreadPoolExecutor` closed with `shutdown(wait=False, cancel_futures=True)` instead of a `with` block. | El registry de plugins ya no bloquea el worker más allá del timeout con un plugin colgado. |
 | AC-03 | Concurrency | Forensic report path is now unique per run (`_unique_report_path()`, threaded via the result dict) — concurrent `full_analysis` requests no longer race on one shared HTML file. | El path del reporte forense es único por run — requests concurrentes ya no compiten por un mismo archivo HTML. |
+| F-03 | Fusion | **Asymmetric fusion + abstention shipped**: toward-AI budget capped (+0.35 single family / +0.6 corroborated) vs −1.2 toward-human; `Inconclusive` verdict band (gray zone, seed disagreement, <200 words, code/quote-heavy, contradictory evidence) with `verdict_uncertainty.reason`; per-signal `contributions` exposed in the API. | **Fusión asimétrica + abstención**: presupuesto pro-IA acotado vs −1.2 pro-humano; veredicto `Inconclusive` con razón explícita; `contributions` por señal expuestas en el API. |
+| T-02 | Training | **Corpus→training toolkit** ([scripts/corpus/](scripts/corpus/)): pre-2022 DB extraction, Batches-API AI generation, production-pipeline vectorization, group-split training + temperature calibration + TPR@FPR=1%; deploy via `FUSION_WEIGHTS_PATH`. **Neural promotion pipeline** ([scripts/retrain_pipeline.py](scripts/retrain_pipeline.py)) with `MODEL_FALLBACK_DIR` rollback + [`/api/drift-status`](#get-apidrift-status). | **Toolkit corpus→entrenamiento** + **pipeline de promoción neural** con rollback automático y monitor de drift. |
+| DOC-02 | Docs | **Bilingual retraining manual**: [docs/RETRAINING_MANUAL.md](docs/RETRAINING_MANUAL.md) — the full operational cycle (corpus, fusion layer, neural layer, promotion, monitoring). **Best-configuration guide**: [§ Best Configuration](#-best-configuration--maximum-reliability--mejor-configuración--máxima-fiabilidad). | **Manual de reentrenamiento bilingüe** + **guía de mejor configuración** para resultados fiables. |
 
 ---
 
@@ -978,6 +981,46 @@ curl http://localhost:5006/ready
 
 ---
 
+### GET /api/drift-status
+
+Model-quality monitor (anti-drift). Reports rolling confidence statistics, class balance,
+recent alerts, and **exactly which weight files each worker loaded** (fallback detection).
+Unauthenticated by design — aggregate metrics only, never analyzed text. `"degraded"` is
+the operational trigger for the retraining cycle ([docs/RETRAINING_MANUAL.md](docs/RETRAINING_MANUAL.md)).
+
+```bash
+curl http://localhost:5006/api/drift-status
+```
+
+```json
+{
+    "status": "healthy",
+    "samples_total": 1234,
+    "window_samples": 100,
+    "mean_confidence": 0.91,
+    "baseline_confidence": 0.93,
+    "ai_share": 0.46,
+    "recent_alerts": [],
+    "model": {
+        "version": "2026.07",
+        "device": "cpu",
+        "weights": [
+            {"requested": "modernbert.bin", "loaded_from": ".../modernbert.bin", "fallback": false}
+        ],
+        "fallbacks_used": []
+    }
+}
+```
+
+```python
+import requests
+s = requests.get("http://localhost:5006/api/drift-status").json()
+if s.get("status") == "degraded" or s.get("model", {}).get("fallbacks_used"):
+    alert_ops(s)   # time to run the retraining pipeline / a worker is on fallback weights
+```
+
+---
+
 ### GET /plugins
 
 List all registered plugins with descriptions.
@@ -994,6 +1037,205 @@ Serve a generated HTML forensic report from `/tmp`. Only files with a `forensic_
 
 ```bash
 curl http://localhost:5006/report/forensic_abc123.html
+```
+
+---
+
+## 🎯 Best Configuration — Maximum Reliability / Mejor Configuración — Máxima Fiabilidad
+
+> **EN + ES.** This section answers one question: *which endpoint, which plugins, and which
+> settings produce the most accurate, most defensible verdict this system can give* — and
+> how to read that verdict correctly. / Esta sección responde una sola pregunta: *qué
+> endpoint, qué plugins y qué configuración producen el veredicto más preciso y defendible
+> que este sistema puede dar* — y cómo leerlo correctamente.
+
+### 1. Endpoint decision table / Tabla de decisión de endpoint
+
+| Use case / Caso de uso | Endpoint | Plugins | Why / Por qué |
+|---|---|---|---|
+| **Verdicts that matter** (academic integrity, reports someone will act on) / **Veredictos que importan** | `POST /analyze_document_async` → `GET /analyze_status/<id>` | `["full_analysis", "ai_detection"]` | Runs the ENTIRE forensic pipeline (neural ensemble + all Tier-1 signals + late fusion + forensic report) with a time budget scaled to document size — nothing is skipped for latency. / Corre TODO el pipeline forense con presupuesto de tiempo escalado al documento — nada se recorta por latencia. |
+| Interactive screening (UI, quick check) / Cribado interactivo | `POST /analyze_document` | `["ai_detection"]` | Fastest complete answer: per-paragraph neural verdict + segments, no forensic overhead. / Respuesta completa más rápida. |
+| Progressive UI (results as they finish) / UI progresiva | `POST /analyze_stream` (SSE) | any subset | Each plugin's result streams the moment it completes. |
+| Single-signal microservice calls | `POST /analyze` | one specific plugin | Cached 1 h by `sha256(MODEL_VERSION+text+plugins)`. |
+
+**The recommended combination / La combinación recomendada:**
+
+```json
+{"text": "<document>", "plugins": ["full_analysis", "ai_detection"]}
+```
+
+`full_analysis` produces the fused verdict + forensic evidence; `ai_detection` adds the
+per-segment heatmap the UI renders. They share the neural inference through the in-process
+cache, so requesting both costs almost nothing extra. / Comparten la inferencia neural vía
+caché in-process: pedir ambos casi no cuesta extra.
+
+### 2. Server configuration for maximum integrity / Configuración del servidor
+
+```bash
+# ── Verdict quality / Calidad del veredicto ────────────────────────────────
+FUSION_ACTIVE=1              # default. Late fusion drives the verdict (NEVER neural-only)
+FUSION_WEIGHTS_PATH=...      # AFTER training (docs/RETRAINING_MANUAL.md): calibrated
+                             # logistic fusion → fusion.calibrated becomes true.
+                             # Absent = bounded heuristic fusion (safe default).
+PERPLEXITY_TIER2=1           # default. GPT-2 reference perplexity (Tier 1 proxy alone is weak)
+SEMANTIC_NLI=0               # 1 = NLI contradiction detection (better signal, +RAM/latency)
+HYBRID_WINDOWS=0             # default. Paragraph mode: same heatmap granularity, ~½ CPU.
+                             # Set 1 only if you need overlapping-window smoothing.
+MIN_VERDICT_WORDS=200        # abstain ("Inconclusive") below this — short texts are noise
+
+# ── Versioning + monitoring / Versionado + monitoreo ───────────────────────
+MODEL_VERSION=2026.07        # bump on EVERY weights/threshold change (invalidates caches)
+METRICS_LOG_PATH=/var/log/xplagiax/verdicts.jsonl   # 1 JSON line per verdict (drift watch)
+
+# ── Throughput (defaults are sane) / Rendimiento ───────────────────────────
+PLUGIN_MAX_WORKERS=8         # shared plugin thread pool
+REQUEST_DEADLINE_SECONDS=60  # hard wall-clock cap for SYNC endpoints (async scales itself)
+TORCH_NUM_THREADS=1          # keep 1 under gunicorn (avoids CPU oversubscription)
+```
+
+### 3. The reliable flow, end to end / El flujo fiable, de punta a punta
+
+**curl:**
+
+```bash
+# 1. Enqueue / Encolar
+TASK=$(curl -s -X POST http://localhost:5006/analyze_document_async \
+  -H "Content-Type: application/json" -H "X-API-Key: $KEY" \
+  -d '{"text": "'"$(cat thesis.txt | sed 's/"/\\"/g')"'",
+       "plugins": ["full_analysis", "ai_detection"]}' | python3 -c \
+  'import sys,json; print(json.load(sys.stdin)["task_id"])')
+
+# 2. Poll until done / Sondear hasta terminar
+curl -s -H "X-API-Key: $KEY" http://localhost:5006/analyze_status/$TASK
+```
+
+**Python:**
+
+```python
+import requests, time
+
+BASE, KEY = "http://localhost:5006", "your-api-key"
+H = {"X-API-Key": KEY}
+
+task = requests.post(f"{BASE}/analyze_document_async", headers=H, json={
+    "text": open("thesis.txt", encoding="utf-8").read(),
+    "plugins": ["full_analysis", "ai_detection"],
+}).json()["task_id"]
+
+while True:
+    r = requests.get(f"{BASE}/analyze_status/{task}", headers=H).json()
+    if r["state"] in ("SUCCESS", "FAILURE"):
+        break
+    time.sleep(5)
+
+fa = r["results"]["full_analysis"]["data"]
+verdict     = fa["forensic"]["verdict"]          # AI-Generated | Human-Written | Hybrid | Inconclusive
+p_ai        = fa["fusion"]["probability"]        # fused P(AI) ∈ [0,1] — THE number to use
+calibrated  = fa["fusion"]["calibrated"]         # True only after trained weights are deployed
+why         = fa["fusion"]["contributions"]      # per-signal log-odds: what pushed the score
+abstained   = fa.get("verdict_uncertainty")      # reason when verdict == "Inconclusive"
+segments    = r["results"]["ai_detection"]["data"]["segments"]   # per-paragraph heatmap
+```
+
+### 4. Reading the result correctly / Leer el resultado correctamente
+
+The decision object (`results.full_analysis.data`, abridged) / El objeto de decisión:
+
+```json
+{
+  "detection":  {"prediction": "AI", "ai_percentage": 84.1, "uncertainty_zone": false},
+  "forensic":   {"verdict": "AI-Generated", "confidence": 0.8123,
+                 "scores": {"neural": 0.84, "reasoning": 0.41, "watermark": 0.0}},
+  "fusion": {
+      "probability": 0.8123,
+      "calibrated": false,
+      "source": "heuristic_fusion",
+      "note": "Bounded model-agnostic heuristic fusion (UNCALIBRATED, asymmetric clamp...)",
+      "contributions": {
+          "neural_softened": 1.04,
+          "dsc_uniformity": 0.31,
+          "hal_overall": 0.18,
+          "sty_burstiness": -0.09,
+          "_active_families": 2.0,
+          "_adjustment_clamped": 0.40
+      },
+      "degraded_signals": []
+  },
+  "verdict_uncertainty": null,
+  "author_signature": {"consistency_score": 0.71, "outlier_ratio": 0.0},
+  "discourse_structure": {"uniformity": 0.44, "language": "es"},
+  "semantic_consistency": {"strong_contradiction_ratio": 0.0}
+}
+```
+
+**Interpretation rules / Reglas de interpretación:**
+
+| `fusion.probability` | Meaning / Significado | Action / Acción |
+|---|---|---|
+| ≥ 0.90 | Strong AI evidence / Evidencia fuerte de IA | Report with the evidence list — never as "proof" / Nunca como "prueba" |
+| 0.60 – 0.90 | Moderate evidence / Evidencia moderada | Show contributions for + against |
+| **0.40 – 0.60** | **Gray band → verdict is "Inconclusive"** / **Franja gris → "Inconclusive"** | **Human review. The system abstained on purpose** / **Revisión humana. Abstención deliberada** |
+| 0.10 – 0.40 | Weak AI evidence / Evidencia débil | Report as "no sufficient evidence" |
+| < 0.10 | No AI evidence / Sin evidencia | — |
+
+**Five rules that keep the result honest / Cinco reglas que mantienen el resultado honesto:**
+
+1. **Use `fusion.probability`, not `detection.ai_percentage`.** The fusion is the verdict:
+   bounded, multi-signal, with an asymmetric clamp that blocks false-positive pile-ups. The
+   raw neural % is one input to it. / La fusión ES el veredicto; el % neural crudo es solo
+   una entrada.
+2. **`"Inconclusive"` is a feature, not an error.** It fires on: <200 words, gray band,
+   the 3 model seeds disagreeing (out-of-distribution text), code-heavy documents, heavily
+   quoted documents, or contradictory evidence. `verdict_uncertainty.reason` says which.
+   Treat it as "route to a human". / Es una abstención deliberada, no un fallo.
+3. **Check `fusion.calibrated`.** `false` = the probability is *ordinal* (bigger = more
+   evidence) but "0.8 ≠ 80% certainty". `true` (after deploying trained weights) = the
+   number is a calibrated probability you can threshold. / Con `false`, el número ordena;
+   con `true`, el número ES una probabilidad.
+4. **Check `fusion.degraded_signals`.** Non-empty = some plugin failed and its signal
+   defaulted to 0 — the verdict stands on fewer legs. / No vacío = el veredicto se apoya
+   en menos señales.
+5. **Explain with `contributions`.** Positive log-odds pushed toward AI, negative toward
+   human, `*_excluded_lang` = gated out for non-English text. This is the sentence you can
+   put in front of a committee. / Es la frase que puedes defender ante un comité.
+
+### 5. Verdict semantics / Semántica del veredicto
+
+| `forensic.verdict` | Emitted when / Se emite cuando |
+|---|---|
+| `AI-Generated` | Fused P(AI) ≥ 0.60 outside every abstention rule |
+| `Human-Written` | Fused P(AI) ≤ 0.40 outside every abstention rule |
+| `Hybrid` | Per-paragraph analysis found distinct AI and human sections — read `segment_analysis.paragraph_scores` + `breakpoint_count`, not the global % |
+| `Inconclusive` | Any abstention rule fired — `verdict_uncertainty.reason` explains |
+
+---
+
+## 🧠 Retraining / Reentrenamiento
+
+The detector ages: every new LLM family is out-of-distribution and precision decays
+**silently**. The full operational cycle — corpus construction from your pre-2022 DB,
+fusion training + calibration (CPU-only), neural fine-tuning (Colab), atomic promotion
+with automatic rollback, drift monitoring — is documented step by step, bilingually, in:
+
+**→ [docs/RETRAINING_MANUAL.md](docs/RETRAINING_MANUAL.md)**
+
+Quick reference / Referencia rápida:
+
+```bash
+# Trigger check / Chequeo de disparo
+curl -s http://localhost:5006/api/drift-status          # "degraded" → retrain
+
+# Layer A — fusion (CPU, hours):    corpus → vectorize → train → FUSION_WEIGHTS_PATH
+python scripts/corpus/extract_human.py --dry-run
+python scripts/corpus/generate_ai.py --limit 2000
+python scripts/corpus/vectorize.py dataset/*.jsonl --out dataset/vectors
+python scripts/corpus/train_fusion.py --vectors dataset/vectors --out models/fusion_weights.json
+
+# Layer B — neural (Colab GPU + safe promotion / promoción segura)
+python scripts/retrain_pipeline.py collect  --corpus data/gold
+python scripts/retrain_pipeline.py evaluate --corpus data/gold
+python scripts/retrain_pipeline.py promote  --corpus data/gold \
+    --weights /path/new/modernbert.bin --version 2026.08 --min-gain 0.01
 ```
 
 ---

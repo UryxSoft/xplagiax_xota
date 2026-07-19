@@ -192,7 +192,10 @@ _ABBREV_PATTERN = re.compile(
 _DECIMAL_PATTERN = re.compile(r"(\d)\.(\d)")
 # 2+ uppercase letters before a period — almost never a sentence boundary.
 # Handles 100%-uppercase text where _ABBREV_PATTERN's title-case assumptions break.
-_ACRONYM_PATTERN = re.compile(r"\b([A-Z]{2,})\.")
+# Protect "NASA. and" / "CIA. work" (lowercase continues the sentence) but NOT
+# "MIT. He" — an all-caps acronym followed by a capitalized word is a genuine
+# sentence boundary and must stay splittable (EC-01 covers both directions).
+_ACRONYM_PATTERN = re.compile(r"\b([A-Z]{2,})\.(?!\s+[A-Z][a-z])")
 _SENT_SPLIT_RE = re.compile(r"[.!?]+(?=\s|$)")
 
 
