@@ -61,3 +61,5 @@ todos_ambios.tar.gz
 todos_ambios.tar.gz.b64
 cambios_v2.tar.gz
 cambios_v2.tar.gz.b64
+__pycache__/
+*.pyc

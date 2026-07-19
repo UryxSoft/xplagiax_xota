@@ -44,6 +44,25 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="plu
 _REQUEST_DEADLINE_S = float(os.getenv("REQUEST_DEADLINE_SECONDS", "60"))
 
 
+def adaptive_timeout(
+    word_count: int,
+    base: int = 30,
+    per_kwords: float = 15.0,
+    cap: int = 3600,
+) -> int:
+    """Per-plugin timeout scaled to document size.
+
+    A fixed timeout sized for abstracts (30 s) silently breaks thesis-sized
+    inputs: the future times out, the result is discarded, but the plugin
+    thread keeps running the full CPU-bound inference anyway — worst of both
+    worlds. Short texts keep `base`; every 1 000 words adds `per_kwords`
+    seconds (CPU ensemble budget); `cap` bounds the total (sync callers pass
+    a low cap, Celery passes one under its own soft time limit).
+    """
+    scaled = base + (max(0, word_count) / 1000.0) * per_kwords
+    return int(min(cap, max(base, scaled)))
+
+
 class PluginRegistry:
     """Thread-safe registry of analysis plugins."""
 
@@ -102,8 +121,24 @@ class PluginRegistry:
                 down.append(name)
         return down
 
+    @staticmethod
+    def _call_with_context(plugin: Any, text: str, timeout: int, async_mode: bool) -> Any:
+        """Run plugin.analyze inside the per-thread execution context.
+
+        [Fase-2 M-11/M-7] Stamps a cooperative deadline (checked between inference
+        batches in detector_final so timed-out threads stop burning CPU) and the
+        async flag (lets the orchestrator activate async-only signals).
+        """
+        from app.engine.exec_context import set_context, clear_context
+        import time as _time
+        set_context(deadline=_time.monotonic() + timeout, async_mode=async_mode)
+        try:
+            return plugin.analyze(text)
+        finally:
+            clear_context()
+
     def run(self, plugin_names: List[str], text: str,
-            timeout: int = 30) -> Dict[str, Any]:
+            timeout: int = 30, async_mode: bool = False) -> Dict[str, Any]:
         """
         Execute requested plugins in parallel and return aggregated results.
 
@@ -140,7 +175,7 @@ class PluginRegistry:
         budget = min(float(timeout), _REQUEST_DEADLINE_S)
         t0 = time.perf_counter()
         future_to_name: Dict[Any, str] = {
-            _EXECUTOR.submit(plugin.analyze, text): pname
+            _EXECUTOR.submit(self._call_with_context, plugin, text, timeout, async_mode): pname
             for pname, plugin in valid
         }
 
@@ -223,7 +258,7 @@ class PluginRegistry:
         budget = min(float(timeout), _REQUEST_DEADLINE_S)
         t0 = time.perf_counter()
         future_to_name: Dict[Any, str] = {
-            _EXECUTOR.submit(plugin.analyze, text): pname
+            _EXECUTOR.submit(self._call_with_context, plugin, text, timeout, False): pname
             for pname, plugin in valid
         }
 

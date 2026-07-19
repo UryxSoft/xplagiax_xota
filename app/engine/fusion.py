@@ -26,8 +26,10 @@ unit-testable with synthetic dicts.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -80,7 +82,10 @@ _FUSION_SCHEMA: Tuple[str, ...] = (
     # ── Tier-1 model-agnostic signals (survive paraphrasing; help vs frontier models) ──
     "author_outlier_ratio",      # fraction of style-divergent chunks (splice/mix signal)
     "dsc_uniformity",            # templated discourse structure ∈ [0,1]
-    "sem_contradiction_ratio",   # internal contradictions / sentences ∈ [0,1]
+    "sem_contradiction_ratio",   # STRONG contradictions (numeric/NLI) / sentences ∈ [0,1]
+    # ── Fase-2 additions (M-4 pro-human term, M-5 language gate) ──
+    "sty_hapax_ratio",           # hapax legomena ratio ∈ [0,1] — higher in organic human prose
+    "lang_en",                   # 1.0 if document language is English, else 0.0 (gates EN-lexicon features)
 )
 
 FUSION_VECTOR_DIM: int = len(_FUSION_SCHEMA)
@@ -105,6 +110,13 @@ def _num(d: Any, *keys: str, default: float = 0.0) -> float:
         if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
             return float(v)
     return default
+
+
+def _norm01(value: float, scale: float) -> float:
+    """[M-12] value/scale clipped to [0,1] — saturating normalisation."""
+    if scale <= 0:
+        return 0.0
+    return float(np.clip(value / scale, 0.0, 1.0))
 
 
 def _reasoning_feature(reasoning: Dict[str, Any], name: str) -> float:
@@ -176,16 +188,22 @@ class FusionFeatureBuilder:
         aus = aa.get("author_signature", {}) if isinstance(aa.get("author_signature"), dict) else {}
         dsc = aa.get("discourse_structure", {}) if isinstance(aa.get("discourse_structure"), dict) else {}
         sem = aa.get("semantic_consistency", {}) if isinstance(aa.get("semantic_consistency"), dict) else {}
+        lang = aa.get("language", {}) if isinstance(aa.get("language"), dict) else {}
 
+        # [Fase-2 M-12] Every feature is normalised to [0,1] with a documented scale so
+        # the vector is homogeneous (interpretable trained weights, tractable ablation).
+        # Scales: ppl proxy lives on the invented [1,15] scale; curvature is clamped to
+        # [-10,10] upstream; entropy ~[0,10] bits; sentence length saturates at 40 words;
+        # breakpoint/run counts saturate at 6/10 (documents rarely exceed these).
         values: Dict[str, float] = {
             "neural_ai_prob":          float(np.clip(neural_ai_prob, 0.0, 1.0)),
             "neural_uncertainty":      float(np.clip(neural_uncertainty, 0.0, 1.0)),
-            "ppl_proxy_mean":          _num(ppl_fv, "proxy_perplexity_mean"),
+            "ppl_proxy_mean":          _norm01(_num(ppl_fv, "proxy_perplexity_mean"), 15.0),
             "ppl_low_ratio":           _num(ppl_fv, "low_perplexity_ratio"),
-            "ppl_valley_count":        _num(ppl_fv, "perplexity_valley_count"),
-            "ppl_burstiness":          _num(ppl_fv, "burstiness_perplexity"),
-            "ppl_curvature":           _num(ppl_fv, "curvature_score"),
-            "ppl_entropy_mean":        _num(ppl_fv, "token_entropy_mean"),
+            "ppl_valley_count":        _norm01(_num(ppl_fv, "perplexity_valley_count"), 10.0),
+            "ppl_burstiness":          _norm01(_num(ppl_fv, "burstiness_perplexity"), 2.0),
+            "ppl_curvature":           _norm01(_num(ppl_fv, "curvature_score") + 10.0, 20.0),
+            "ppl_entropy_mean":        _norm01(_num(ppl_fv, "token_entropy_mean"), 10.0),
             "rsn_backtracking":        _reasoning_feature(rsn, "backtracking_density"),
             "rsn_cot_scaffold":        _reasoning_feature(rsn, "cot_scaffold_density"),
             "rsn_entropy_norm":        _reasoning_feature(rsn, "word_entropy_normalised"),
@@ -196,17 +214,21 @@ class FusionFeatureBuilder:
             "hal_repetition":          _num(hal_cats, "repetition"),
             "hyb_global_ai":           _num(hyb, "global_ai_score") / 100.0,
             "hyb_ai_ratio":            _num(hyb_fv, "ai_segment_ratio"),
-            "hyb_breakpoints":         _num(hyb_fv, "breakpoint_count"),
-            "hyb_longest_ai_run":      _num(hyb_fv, "longest_ai_run"),
+            "hyb_breakpoints":         _norm01(_num(hyb_fv, "breakpoint_count"), 6.0),
+            "hyb_longest_ai_run":      _norm01(_num(hyb_fv, "longest_ai_run"), 10.0),
             "ref_fabricated_ratio":    _num(ref_fv, "fabricated_ratio"),
             "ref_chimeric_ratio":      _num(ref_fv, "chimeric_ratio"),
             "ref_verified_ratio":      _num(ref_fv, "verified_ratio"),
-            "sty_burstiness":          _num(sty, "burstiness", "burstiness_score"),
+            "sty_burstiness":          _norm01(_num(sty, "burstiness", "burstiness_score"), 1.0),
             "sty_lexical_diversity":   _num(sty, "lexical_diversity", "vocabulary_richness"),
-            "sty_avg_sentence_len":    _num(sty, "avg_sentence_length"),
+            "sty_avg_sentence_len":    _norm01(_num(sty, "avg_sentence_length"), 40.0),
             "author_outlier_ratio":    _num(aus, "outlier_ratio"),
             "dsc_uniformity":          _num(dsc, "uniformity"),
-            "sem_contradiction_ratio": _num(sem, "contradiction_ratio"),
+            # M-6: only STRONG contradictions (numeric mismatch / NLI) feed the fusion;
+            # the noisy negation-flip heuristic stays report-only.
+            "sem_contradiction_ratio": _num(sem, "strong_contradiction_ratio"),
+            "sty_hapax_ratio":         _num(sty, "hapax_legomena_ratio"),
+            "lang_en":                 1.0 if str(lang.get("lang", "en")).lower().startswith("en") else 0.0,
         }
 
         vec = np.array([values[n] for n in _FUSION_SCHEMA], dtype=np.float64)
@@ -228,8 +250,12 @@ def _sigmoid(z: float) -> float:
 class FusionResult:
     probability: float                 # P(AI) ∈ [0,1]
     calibrated: bool                   # False until trained + calibrated
-    source: str                        # "neural_passthrough" | "logistic"
+    source: str                        # "neural_passthrough" | "heuristic_fusion" | "logistic"
     features: Dict[str, float] = field(default_factory=dict)
+    # [Fase-2 M-21/N-15] Per-term log-odds contributions: positive pushed toward AI,
+    # negative toward human, zero-suffixed "_excluded_lang" entries were gated out.
+    # This is the explainability artifact — surface it, never discard it.
+    contributions: Dict[str, float] = field(default_factory=dict)
     note: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -239,6 +265,7 @@ class FusionResult:
             "source": self.source,
             "note": self.note,
             "features": {k: round(v, 6) for k, v in self.features.items()},
+            "contributions": {k: round(v, 4) for k, v in self.contributions.items()},
         }
 
 
@@ -267,22 +294,65 @@ DEFAULT_NEURAL_TEMPERATURE: float = 1.6
 _NEURAL_LOGIT_CAP: float = 4.0
 
 # Bounded log-odds weights for model-agnostic adjustments (each input is in [0,1]).
+# [Fase-2 N-01/N-02] Removed from this dict:
+#   - hyb_ai_ratio: produced by the SAME 3-model ensemble as neural_ai_prob — counting it
+#     here double-counted the neural evidence (it stays in the vector for the TRAINED
+#     fusion, where the logistic regression absorbs the collinearity).
+#   - ppl_low_ratio: Tier-1 proxy is derived from hapax/TTR (not perplexity) and dies
+#     under any edit; too fragile to move a verdict.
 _HEURISTIC_WEIGHTS: Dict[str, float] = {
     "ref_fabricated_ratio":   1.6,   # strong: verified-absent citations (model-agnostic)
     "ref_chimeric_ratio":     0.9,
     "hal_overall":            0.6,   # moderate: internal incoherence
     "rsn_cot_scaffold":       0.5,   # reasoning-model scaffolding
     "rsn_backtracking":       0.5,
-    "ppl_low_ratio":          0.4,   # weak: proxy perplexity
-    "hyb_ai_ratio":           0.6,   # per-paragraph AI coverage
     "dsc_uniformity":         0.7,   # Tier-1: templated discourse (survives paraphrasing)
-    "sem_contradiction_ratio": 0.6,  # Tier-1: internal contradiction (coherence failure)
+    "sem_contradiction_ratio": 0.6,  # Tier-1: STRONG internal contradiction (numeric/NLI)
     "author_outlier_ratio":   0.4,   # Tier-1: style splice (mild mixed-authorship signal)
 }
-# Reference verification is the one signal that pushes toward HUMAN (negative log-odds).
-_HEURISTIC_VERIFIED_WEIGHT: float = -0.6
-# Total adjustment clamp (log-odds). ±1.2 ≈ at most ~0.27 probability shift near 0.5.
-_HEURISTIC_ADJ_CLAMP: float = 1.2
+
+# [Fase-2 M-4] Pro-human terms (negative log-odds). Small, bounded: high burstiness and a
+# rich hapax profile are organic-writing signals; verified citations are external ground
+# truth. Without these, every active default signal could only PUSH toward AI (N-01).
+_HEURISTIC_HUMAN_WEIGHTS: Dict[str, float] = {
+    "sty_burstiness":     -0.35,
+    "sty_hapax_ratio":    -0.25,
+    "ref_verified_ratio": -0.60,
+}
+
+# [Fase-2 M-5] Features whose computation depends on ENGLISH lexicons. On non-English
+# documents they are structurally unreliable, so the gate zeroes them out of the
+# adjustment (reported as excluded). [M-18] discourse_analyzer and semantic_consistency
+# now carry es/fr/pt lexicons and select them by detected language, so only the
+# reasoning-profiler regexes (English CoT markers) remain gated.
+_LEXICON_EN_FEATURES = frozenset({
+    "rsn_cot_scaffold", "rsn_backtracking",
+})
+
+# [Fase-2 M-1] Corroboration families. Signals inside one family measure the same
+# underlying phenomenon (e.g. "formal register"), so they corroborate each other only
+# weakly. The positive adjustment is allowed its full budget only when at least TWO
+# independent families are active; reference evidence (external ground truth) counts as
+# two families on its own.
+_FAMILY_MAP: Dict[str, str] = {
+    "ref_fabricated_ratio":    "reference",
+    "ref_chimeric_ratio":      "reference",
+    "rsn_cot_scaffold":        "structure",
+    "rsn_backtracking":        "structure",
+    "dsc_uniformity":          "structure",
+    "hal_overall":             "coherence",
+    "sem_contradiction_ratio": "coherence",
+    "author_outlier_ratio":    "authorship",
+}
+_FAMILY_ACTIVE_MIN: float = 0.15    # summed log-odds for a family to count as "active"
+
+# [Fase-2 M-1] ASYMMETRIC adjustment clamps (audit principle #1: cut FP before recall).
+# Positive (toward-AI) budget: +0.35 with a single active family, +0.6 with corroboration.
+# Negative (toward-human) budget: −1.2 — evidence of humanity may temper more than
+# heuristics may accuse.
+_HEURISTIC_ADJ_POS_SINGLE: float = 0.35
+_HEURISTIC_ADJ_POS_CORROBORATED: float = 0.6
+_HEURISTIC_ADJ_NEG: float = -1.2
 
 
 def _logit(p: float) -> float:
@@ -297,29 +367,51 @@ def heuristic_fusion(features: Dict[str, float],
     Bounded, model-agnostic, UNCALIBRATED fusion of the assembled features → P(AI).
 
     Returns (probability, contributions_in_logodds). The neural term (temperature-softened)
-    dominates; plugin adjustments are summed in log-odds and clamped so they refine, never
-    dictate, the verdict.
+    dominates; plugin adjustments are summed in log-odds under an ASYMMETRIC clamp:
+    the toward-AI budget is small and only grows when ≥2 independent signal families
+    corroborate each other, while toward-human evidence keeps a larger budget
+    (Fase-2 N-01 fix — accumulated genre-correlated heuristics must not flip a
+    human verdict on their own).
     """
     neural = float(features.get("neural_ai_prob", 0.5))
     capped = float(np.clip(_logit(neural), -_NEURAL_LOGIT_CAP, _NEURAL_LOGIT_CAP))
     base_lo = capped / max(temperature, 1e-6)
 
+    is_english = float(features.get("lang_en", 1.0)) >= 0.5
+
     contributions: Dict[str, float] = {"neural_softened": base_lo}
     adj = 0.0
+    family_lo: Dict[str, float] = {}
     for feat, w in _HEURISTIC_WEIGHTS.items():
+        if not is_english and feat in _LEXICON_EN_FEATURES:
+            contributions[f"{feat}_excluded_lang"] = 0.0
+            continue
+        v = float(np.clip(features.get(feat, 0.0), 0.0, 1.0))
+        c = w * v
+        if c != 0.0:
+            contributions[feat] = c
+            fam = _FAMILY_MAP.get(feat)
+            if fam is not None:
+                family_lo[fam] = family_lo.get(fam, 0.0) + c
+        adj += c
+
+    # Pro-human terms (negative log-odds), always active.
+    for feat, w in _HEURISTIC_HUMAN_WEIGHTS.items():
         v = float(np.clip(features.get(feat, 0.0), 0.0, 1.0))
         c = w * v
         if c != 0.0:
             contributions[feat] = c
         adj += c
-    # Reference verification tempers toward human.
-    ver = float(np.clip(features.get("ref_verified_ratio", 0.0), 0.0, 1.0))
-    if ver > 0:
-        c = _HEURISTIC_VERIFIED_WEIGHT * ver
-        contributions["ref_verified_ratio"] = c
-        adj += c
 
-    adj = float(np.clip(adj, -_HEURISTIC_ADJ_CLAMP, _HEURISTIC_ADJ_CLAMP))
+    # Corroboration rule: full positive budget only with ≥2 active families;
+    # external ground truth (reference) corroborates on its own.
+    active = sum(1 for lo in family_lo.values() if lo >= _FAMILY_ACTIVE_MIN)
+    if family_lo.get("reference", 0.0) >= _FAMILY_ACTIVE_MIN:
+        active += 1
+    pos_cap = _HEURISTIC_ADJ_POS_CORROBORATED if active >= 2 else _HEURISTIC_ADJ_POS_SINGLE
+
+    adj = float(np.clip(adj, _HEURISTIC_ADJ_NEG, pos_cap))
+    contributions["_active_families"] = float(active)
     contributions["_adjustment_clamped"] = adj
     p = 1.0 / (1.0 + math.exp(-(base_lo + adj)))
     return float(np.clip(p, 0.0, 1.0)), contributions
@@ -371,10 +463,11 @@ class FusionClassifier:
             p, contrib = heuristic_fusion(feat)
             return FusionResult(
                 probability=p, calibrated=False, source="heuristic_fusion",
-                features=feat,
-                note="Bounded model-agnostic heuristic fusion (UNCALIBRATED). Plugins "
-                     "contribute but the neural ensemble dominates. Train with fit(X, y) "
-                     "on a labelled corpus + calibrate to replace this.",
+                features=feat, contributions=contrib,
+                note="Bounded model-agnostic heuristic fusion (UNCALIBRATED, asymmetric "
+                     "clamp + corroboration rule). Plugins contribute but the neural "
+                     "ensemble dominates. Train with fit(X, y) on a labelled corpus + "
+                     "calibrate to replace this.",
             )
 
         x = vec.astype(np.float64)
@@ -386,11 +479,14 @@ class FusionClassifier:
         if self._calibrator is not None:
             p = float(self._calibrator.apply(p))
             calibrated = True
+        # Per-term contributions for the trained path: weight × standardized input.
+        contrib = {n: float(w * xi) for n, w, xi in zip(names, self._weights, x)}
+        contrib["_bias"] = self._bias
         return FusionResult(
             probability=float(np.clip(p, 0.0, 1.0)),
             calibrated=calibrated,
             source="logistic",
-            features=feat,
+            features=feat, contributions=contrib,
             note="Trained logistic fusion." + ("" if calibrated else " NOT calibrated."),
         )
 
@@ -465,3 +561,81 @@ class FusionClassifier:
     @property
     def is_trained(self) -> bool:
         return self._trained
+
+    # ── Persistence [Fase-2 M-19 wiring] ────────────────────────────────────
+    def to_payload(self) -> Dict[str, Any]:
+        """Serializable snapshot of a trained model (+ calibrator temperature)."""
+        if not self._trained or self._weights is None:
+            raise ValueError("Cannot serialize an untrained FusionClassifier")
+        temp = getattr(self._calibrator, "temperature", None)
+        return {
+            "schema": "fusion-weights-v1",
+            "feature_names": list(FEATURE_NAMES),
+            "weights": [float(w) for w in self._weights],
+            "bias": self._bias,
+            "mean": [float(m) for m in self._mean] if self._mean is not None else None,
+            "std": [float(s) for s in self._std] if self._std is not None else None,
+            "temperature": float(temp) if temp is not None else None,
+        }
+
+    def load_payload(self, payload: Dict[str, Any]) -> "FusionClassifier":
+        """
+        Load weights produced by scripts/corpus/train_fusion.py.
+
+        Refuses payloads whose feature_names do not EXACTLY match the current
+        _FUSION_SCHEMA — a schema drift means the weights are meaningless and
+        silently applying them would corrupt every verdict.
+        """
+        names = payload.get("feature_names")
+        if tuple(names or ()) != FEATURE_NAMES:
+            raise ValueError(
+                "Fusion weights schema mismatch: trained on "
+                f"{len(names or [])} features, current schema has "
+                f"{len(FEATURE_NAMES)}. Retrain (scripts/corpus/train_fusion.py) "
+                "before deploying."
+            )
+        self.set_weights(payload["weights"], bias=payload.get("bias", 0.0),
+                         mean=payload.get("mean"), std=payload.get("std"))
+        temp = payload.get("temperature")
+        if temp is not None:
+            from calibration import TemperatureScaler
+            self.attach_calibrator(TemperatureScaler(temperature=float(temp), fitted=True))
+        return self
+
+
+# ============================================================================
+# Shared instance [Fase-2 M-13 + M-19 wiring]
+# ============================================================================
+# One process-wide classifier. If FUSION_WEIGHTS_PATH points at a weights file
+# produced by scripts/corpus/train_fusion.py, it is loaded ONCE at first use and
+# every request runs the trained+calibrated logistic fusion instead of the
+# interim heuristic. Remember to bump MODEL_VERSION when deploying new weights
+# (invalidates the namespaced result caches).
+
+_shared_fusion: Optional[FusionClassifier] = None
+
+
+def get_fusion_classifier() -> FusionClassifier:
+    """Return the process-wide FusionClassifier (created lazily; loads trained
+    weights from FUSION_WEIGHTS_PATH when set)."""
+    global _shared_fusion
+    if _shared_fusion is None:
+        clf = FusionClassifier()
+        weights_path = os.getenv("FUSION_WEIGHTS_PATH", "")
+        if weights_path:
+            try:
+                with open(weights_path, "r", encoding="utf-8") as fh:
+                    clf.load_payload(json.load(fh))
+                logger.info(
+                    "Trained fusion weights loaded from %s (calibrated=%s). "
+                    "Ensure MODEL_VERSION was bumped for this deploy.",
+                    weights_path, clf._calibrator is not None,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to load fusion weights from %s — falling back to "
+                    "heuristic fusion: %s", weights_path, exc,
+                )
+                clf = FusionClassifier()
+        _shared_fusion = clf
+    return _shared_fusion

@@ -79,7 +79,12 @@ class Config:
 
     # ── Plugin settings ────────────────────────────────────────────
     PLUGIN_DIR = "app/plugins"
-    PLUGIN_TIMEOUT = 30  # seconds per plugin
+    # Base seconds per plugin for SHORT texts. Long documents scale this up —
+    # see plugin_registry.adaptive_timeout(); a fixed 30 s killed any
+    # thesis-sized analysis while the worker thread kept burning CPU.
+    PLUGIN_TIMEOUT = int(os.environ.get("PLUGIN_TIMEOUT", "30"))
+    # Extra seconds granted per 1 000 words of input (CPU inference budget).
+    PLUGIN_TIMEOUT_PER_KWORDS = float(os.environ.get("PLUGIN_TIMEOUT_PER_KWORDS", "15"))
 
     # ── API Security ───────────────────────────────────────────────
     API_KEY = os.environ.get("API_KEY", "")  # empty = auth disabled

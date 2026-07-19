@@ -67,6 +67,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -304,6 +305,18 @@ class PluginOrchestrator:
         StylometricProfiler so callers can access stats without opening the report.
         """
         additional: Dict[str, Any] = {}
+        # [Fase-2 M-8] Names of enabled plugins whose run failed — surfaced so the
+        # report can distinguish "signal absent because it broke" from "neutral signal".
+        degraded: list = []
+
+        # ── Language identification [Fase-2 M-5] ──────────────────────
+        # Cheap stopword-ratio detection; gates the English-lexicon Tier-1 features
+        # inside the fusion and is reported to the user.
+        try:
+            from lang_detect import detect_language
+            additional["language"] = detect_language(text)
+        except Exception as exc:
+            logger.warning("Language detection failed: %s", exc)
 
         # ── StylometricProfiler ───────────────────────────────────────
         if self._stylometric is not None:
@@ -317,6 +330,7 @@ class PluginOrchestrator:
                     stats.get("hapax_legomena_ratio", 0.0),
                 )
             except Exception as exc:
+                degraded.append("stylometric")
                 logger.warning("StylometricProfiler.compute_stats() failed: %s", exc)
 
         # ── ReasoningProfiler ─────────────────────────────────────────
@@ -354,6 +368,7 @@ class PluginOrchestrator:
                     logger.debug("Reasoning (partial): score=%.4f level=%s",
                                  ai_score, risk_level)
             except Exception as exc:
+                degraded.append("reasoning")
                 logger.warning("ReasoningProfiler.vectorize() failed: %s", exc)
 
         # ── HallucinationProfiler ─────────────────────────────────────
@@ -402,6 +417,7 @@ class PluginOrchestrator:
                     ppl_stats.get("proxy_perplexity_mean", 0.0),
                 )
             except Exception as exc:
+                degraded.append("perplexity")
                 logger.warning("PerplexityProfiler.compute_stats() failed: %s", exc)
 
         # ── HybridSegmentAnalyzer [NEW v3.9] ──────────────────────────
@@ -420,6 +436,7 @@ class PluginOrchestrator:
                     hybrid_result.total_windows,
                 )
             except Exception as exc:
+                degraded.append("hybrid_segment")
                 logger.warning("HybridSegmentAnalyzer.analyze() failed: %s", exc)
 
         # ── WatermarkDecoder ──────────────────────────────────────────
@@ -432,43 +449,72 @@ class PluginOrchestrator:
                     sig.detected, sig.confidence, sig.scheme_type,
                 )
             except Exception as exc:
+                degraded.append("watermark")
                 logger.warning("WatermarkDecoder.detect() failed: %s", exc)
 
         # ── Tier-1 model-agnostic signals (feed the fusion + reported standalone) ──
-        if self.config.enable_author_signature and self._stylometric is not None:
+        # Authorship consistency: embedding engine (LUAR, opt-in via
+        # ENABLE_AUTHOR_EMBEDDING=1 — see docs/sota/D_AUTHOR_SIGNATURE.md) with
+        # fallback to the stylometric implementation. Both emit `outlier_ratio`,
+        # so the fusion feature is source-agnostic.
+        if self.config.enable_author_signature:
+            _authsig_done = False
             try:
-                from authorship_consistency import compute_authorship_consistency
-                additional["author_signature"] = compute_authorship_consistency(
-                    self._stylometric, text)
+                import author_embedding
+                if author_embedding.is_available():
+                    _authsig = author_embedding.analyze_document(text)
+                    if _authsig.get("status") == "ok":
+                        additional["author_signature"] = _authsig
+                        _authsig_done = True
             except Exception as exc:
-                logger.warning("authorship_consistency failed: %s", exc)
+                logger.warning("author embedding failed: %s", exc)
+            if not _authsig_done and self._stylometric is not None:
+                try:
+                    from authorship_consistency import compute_authorship_consistency
+                    additional["author_signature"] = compute_authorship_consistency(
+                        self._stylometric, text)
+                except Exception as exc:
+                    degraded.append("author_signature")
+                    logger.warning("authorship_consistency failed: %s", exc)
 
         if self._discourse_analyzer is not None:
             try:
                 additional["discourse_structure"] = self._discourse_analyzer.analyze(text)
             except Exception as exc:
+                degraded.append("discourse_structure")
                 logger.warning("discourse analysis failed: %s", exc)
 
         if self._semantic_analyzer is not None:
             try:
                 additional["semantic_consistency"] = self._semantic_analyzer.analyze(text)
             except Exception as exc:
+                degraded.append("semantic_consistency")
                 logger.warning("semantic consistency failed: %s", exc)
 
         # ── LATE FUSION (model-agnostic, bounded, UNCALIBRATED) ───────────
         # Compute the fused P(AI) here, in the pipeline coordinator that owns `additional`,
         # so it is BOTH visible in the returned additional_analyses AND consumed by the
         # forensic verdict. The verdict no longer depends on the neural ensemble alone.
+        # [Fase-2 M-8] Surface degraded plugins BEFORE fusion so both the fusion dict
+        # and the report can state which signals are missing (a failed signal defaults
+        # to 0.0 in the vector — absent, not neutral, but the reader must know).
+        if degraded:
+            additional["degraded_signals"] = sorted(set(degraded))
+
         if os.getenv("FUSION_ACTIVE", "1") == "1" and detection_result is not None:
             try:
-                from fusion import FusionClassifier
-                _fres = FusionClassifier().predict_proba(detection_result, additional)
-                additional["fusion"] = _fres.to_dict()
+                from fusion import get_fusion_classifier
+                _fres = get_fusion_classifier().predict_proba(detection_result, additional)
+                _fdict = _fres.to_dict()
+                if degraded:
+                    _fdict["degraded_signals"] = sorted(set(degraded))
+                additional["fusion"] = _fdict
             except Exception as exc:
                 logger.warning("Fusion scoring failed: %s", exc)
 
         # ── ForensicReportGenerator ───────────────────────────────────
         forensic_report = None
+        forensic_report_path = None
         if self._forensic_generator is not None:
             try:
                 forensic_report = self._forensic_generator.generate_report(
@@ -477,11 +523,15 @@ class PluginOrchestrator:
                     additional_analyses=additional,
                     generate_visuals=True,
                 )
-                path = self.config.forensic_output_path
+                # Unique path per run. The orchestrator is a singleton, so the fixed
+                # config.forensic_output_path let concurrent requests race on the same
+                # file; each run now writes its own path (threaded out via the result).
+                path = _unique_report_path()
                 if self.config.forensic_output_format == "json":
                     self._forensic_generator.export_json(forensic_report, path)
                 else:
                     self._forensic_generator.export_html(forensic_report, path)
+                forensic_report_path = path
                 logger.info(
                     "Forensic report -> %s  verdict=%s  confidence=%.1f%%",
                     path, forensic_report.verdict, forensic_report.confidence * 100,
@@ -490,10 +540,14 @@ class PluginOrchestrator:
                 logger.warning("ForensicReportGenerator failed: %s", exc)
 
         return {
-            "detection_result":    detection_result,
-            "additional_analyses": additional,
-            "forensic_report":     forensic_report,
+            "detection_result":     detection_result,
+            "additional_analyses":  additional,
+            "forensic_report":      forensic_report,
+            "forensic_report_path": forensic_report_path,
         }
+
+
+
 
     # ── Reasoning score helpers ────────────────────────────────────────
     # These exist solely because ReasoningProfiler produces a raw 15-dim
@@ -609,7 +663,7 @@ class PluginOrchestrator:
             lines += ["", "  Forensic Report:",
                 f"    verdict={fr.verdict}  neural={fr.neural_score:.2f}  "
                 f"reasoning={fr.reasoning_score:.2f}  watermark={fr.watermark_score:.2f}",
-                f"    saved \u2192 {self.config.forensic_output_path}"]
+                f"    saved \u2192 {result.get('forensic_report_path') or self.config.forensic_output_path}"]
 
         lines += ["", f"  Active plugins: {', '.join(self.active_plugins())}", sep]
         return "\n".join(lines)

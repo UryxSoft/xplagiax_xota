@@ -2,11 +2,13 @@
 app/tasks.py — Background tasks for Celery.
 """
 import gc
+import os
 import time
 import logging
 from celery.exceptions import SoftTimeLimitExceeded
 from flask import current_app
 from app.celery_app import celery
+from app.plugin_registry import adaptive_timeout
 from app.routes import _merge_segment_results
 
 logger = logging.getLogger(__name__)
@@ -35,10 +37,14 @@ def _strip_base64(results: dict) -> dict:
 @celery.task(
     bind=True,
     name="analyze_document_task",
-    # Hard kill after 5 min — prevents zombie tasks from blocking the worker
-    time_limit=300,
-    # Soft warning at 4 min — task can catch SoftTimeLimitExceeded and clean up
-    soft_time_limit=240,
+    # DEFAULT limits, sized for paper-length texts. The /analyze_document_async
+    # route overrides both per enqueue (apply_async soft_time_limit/time_limit)
+    # scaling them with the document's word count, so thesis-sized inputs get a
+    # proportional budget instead of being hard-killed at 5 minutes.
+    # Hard kill — prevents zombie tasks from blocking the worker.
+    time_limit=int(os.getenv("CELERY_TASK_TIME_LIMIT", "300")),
+    # Soft warning — task catches SoftTimeLimitExceeded and returns a clean error.
+    soft_time_limit=int(os.getenv("CELERY_TASK_SOFT_TIME_LIMIT", "240")),
 )
 def analyze_document_task(self, payload):
     """
@@ -48,7 +54,8 @@ def analyze_document_task(self, payload):
     Memory management:
     - gc.collect() is called after each run to free Python-managed objects.
     - torch cache is cleared to prevent GPU/CPU tensor accumulation.
-    - time_limit=300s kills runaway tasks before they OOM the worker.
+    - time_limit (default 300 s, scaled with word count at enqueue) kills
+      runaway tasks before they OOM the worker.
     - base64 chart images are stripped before Redis serialization.
     """
     t0 = time.perf_counter()
@@ -61,11 +68,23 @@ def analyze_document_task(self, payload):
     self.update_state(state='STARTED', meta={'plugins': plugins_requested})
 
     registry = current_app.config["PLUGIN_REGISTRY"]
-    timeout = current_app.config.get("PLUGIN_TIMEOUT", 120)
+
+    # Per-plugin timeout scaled to document size, bounded 30 s under this run's
+    # own soft time limit so the plugin future expires (clean per-plugin error)
+    # before Celery raises SoftTimeLimitExceeded for the whole task.
+    _hard, _soft = (self.request.timelimit or (None, None))
+    _soft = _soft or int(os.getenv("CELERY_TASK_SOFT_TIME_LIMIT", "240"))
+    timeout = adaptive_timeout(
+        len(text.split()),
+        base=max(current_app.config.get("PLUGIN_TIMEOUT", 30), 120),
+        per_kwords=current_app.config.get("PLUGIN_TIMEOUT_PER_KWORDS", 15.0),
+        cap=max(60, _soft - 30),
+    )
 
     try:
-        # 1. Run standard plugins
-        results = registry.run(plugins_requested, text, timeout=timeout)
+        # 1. Run standard plugins. async_mode=True stamps the per-thread execution
+        # context (exec_context) so async-only signals (M-7 reference check) activate.
+        results = registry.run(plugins_requested, text, timeout=timeout, async_mode=True)
     except SoftTimeLimitExceeded:
         logger.warning("Task %s exceeded soft time limit — returning timeout error", self.request.id)
         return {

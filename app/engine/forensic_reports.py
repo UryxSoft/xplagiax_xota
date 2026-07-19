@@ -16,7 +16,7 @@ Changelog (v3.5 -> v3.9):
   - All v3.5 logic preserved. ReasoningRiskClassifier unchanged.
 """
 
-import base64, hashlib, io, json, logging, re
+import base64, hashlib, io, json, logging, os, re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -78,6 +78,35 @@ ATTRIBUTION_DISCLAIMER = (
     "Heatmap por palabra/oración: ayuda visual heurística (no calibrada, sesgada "
     "contra escritura formal/académica/legal/ESL). No determina el veredicto."
 )
+
+# ── Uncertainty-band thresholds [Fase-2 M-3/R-1/R-7] ─────────────────────────
+# Verdicts inside these regimes become "Inconclusive" instead of a coin-flip label.
+# _MIN_VERDICT_WORDS follows the industry floor for scoring (Turnitin publicly refuses
+# <300 words; 200 keeps abstracts scoreable). _DISAGREEMENT_UNCERTAIN matches the
+# uncertainty_zone threshold in detector_final.classify_text_aggregate.
+_MIN_VERDICT_WORDS = int(os.getenv("MIN_VERDICT_WORDS", "200"))
+_UNCERTAINTY_BAND = float(os.getenv("VERDICT_UNCERTAINTY_BAND", "0.10"))
+_DISAGREEMENT_UNCERTAIN = float(os.getenv("DISAGREEMENT_UNCERTAIN_PP", "12.0"))
+
+# [Fase-2 R-3] Source-code detection: the detector was trained on natural-language
+# prose; code blocks skew uniformity/repetition signals and the neural distribution.
+_CODE_LINE_RE = re.compile(
+    r"^\s*(?:def |class |import |from\s+\S+\s+import |function\s|var\s|let\s|const\s"
+    r"|public\s|private\s|#include|return\b|if\s*\(|for\s*\(|while\s*\()"
+    r"|[{};]\s*$|=>|::|</?[a-zA-Z][^>]*>"
+)
+_CODE_RATIO_UNCERTAIN = float(os.getenv("CODE_RATIO_UNCERTAIN", "0.30"))
+
+# [Fase-2 R-4-lite] Quotation density: heavily quoted documents (≥40% of characters
+# inside quotes) are mostly not the author's own prose — scoring them as AI/Human
+# misattributes authorship of the quoted material.
+_QUOTED_SPAN_RE = re.compile(r'"[^"\n]{20,}"|“[^”\n]{20,}”|«[^»\n]{20,}»')
+_QUOTE_RATIO_UNCERTAIN = float(os.getenv("QUOTE_RATIO_UNCERTAIN", "0.40"))
+
+# [Fase-2 R-5] Contradictory evidence: strong fusion contributions in BOTH directions
+# mean the signals disagree — force the uncertain band instead of letting the sum
+# quietly cancel into a confident-looking score.
+_CONTRADICTORY_LO = float(os.getenv("CONTRADICTORY_EVIDENCE_LO", "0.5"))
 
 
 class AttributionCalculator:
@@ -1144,8 +1173,16 @@ class ForensicReportGenerator:
             try:
                 fused = additional.get("fusion")
                 if fused is None:
-                    from fusion import FusionClassifier
-                    fused = FusionClassifier().predict_proba(detection_result, additional).to_dict()
+                    # Standalone fallback (orchestrator didn't run): make sure the
+                    # language gate has its input, then use the shared classifier.
+                    if "language" not in additional:
+                        try:
+                            from lang_detect import detect_language
+                            additional["language"] = detect_language(text)
+                        except Exception:
+                            pass
+                    from fusion import get_fusion_classifier
+                    fused = get_fusion_classifier().predict_proba(detection_result, additional).to_dict()
                     additional["fusion"] = fused
                 overall_score = float(np.clip(fused["probability"], 0.0, 1.0))
                 # Keep an explicit Hybrid verdict (set from per-paragraph analysis); else
@@ -1154,6 +1191,83 @@ class ForensicReportGenerator:
                     verdict = "AI-Generated" if overall_score >= 0.5 else "Human-Written"
             except Exception as exc:
                 logger.warning("Fusion scoring failed, falling back to neural-only: %s", exc)
+
+        # ── UNCERTAINTY BAND [Fase-2 M-3/R-1/R-7] ─────────────────────────────
+        # A probabilistic detector must abstain, not guess: (a) short texts give every
+        # signal too much variance to support a verdict; (b) a fused probability inside
+        # the gray band is a coin flip dressed as a verdict; (c) high disagreement
+        # between the 3 ensemble seeds is a free out-of-distribution warning.
+        if detection_result is not None and verdict != "Hybrid":
+            _wc = len(text.split()) if text else 0
+            _disagree = float(getattr(detection_result, "ensemble_disagreement", 0.0) or 0.0)
+            _reason = None
+            if _wc < _MIN_VERDICT_WORDS:
+                _reason = (f"Text too short ({_wc} words < {_MIN_VERDICT_WORDS}): "
+                           f"signal variance too high for a reliable verdict.")
+            elif abs(overall_score - 0.5) < _UNCERTAINTY_BAND:
+                _reason = (f"Fused probability {overall_score:.2f} falls inside the "
+                           f"uncertainty band (0.5 ± {_UNCERTAINTY_BAND}).")
+            elif _disagree >= _DISAGREEMENT_UNCERTAIN:
+                _reason = (f"Ensemble seeds disagree by {_disagree:.1f} pp "
+                           f"(≥ {_DISAGREEMENT_UNCERTAIN}): likely out-of-distribution text.")
+            else:
+                # [R-3] Source-code density — detector is trained on prose, not code.
+                _lines = [ln for ln in text.splitlines() if ln.strip()] if text else []
+                if _lines:
+                    _code_ratio = sum(1 for ln in _lines if _CODE_LINE_RE.search(ln)) / len(_lines)
+                    if _code_ratio >= _CODE_RATIO_UNCERTAIN:
+                        _reason = (f"Document is {_code_ratio:.0%} source-code-like lines: "
+                                   f"the detector is trained on natural-language prose.")
+                # [R-4-lite] Quotation density — quoted material is not the author's prose.
+                if _reason is None and text:
+                    _quoted = sum(len(m.group(0)) for m in _QUOTED_SPAN_RE.finditer(text))
+                    _quote_ratio = _quoted / max(len(text), 1)
+                    if _quote_ratio >= _QUOTE_RATIO_UNCERTAIN:
+                        _reason = (f"{_quote_ratio:.0%} of the text sits inside quotation "
+                                   f"marks: authorship of quoted material cannot be "
+                                   f"attributed to the document author.")
+                # [R-5] Contradictory evidence — strong pushes in BOTH directions.
+                if _reason is None:
+                    _contrib = (additional.get("fusion") or {}).get("contributions") or {}
+                    _pos = sum(v for k, v in _contrib.items()
+                               if not k.startswith("_") and k != "neural_softened" and v > 0)
+                    _neg = sum(v for k, v in _contrib.items()
+                               if not k.startswith("_") and k != "neural_softened" and v < 0)
+                    if _pos >= _CONTRADICTORY_LO and _neg <= -_CONTRADICTORY_LO:
+                        _reason = (f"Contradictory evidence: signals push toward AI "
+                                   f"(+{_pos:.2f} log-odds) and toward human "
+                                   f"({_neg:.2f} log-odds) simultaneously.")
+            if _reason is not None:
+                verdict = "Inconclusive"
+                additional["verdict_uncertainty"] = {
+                    "reason": _reason,
+                    "word_count": _wc,
+                    "ensemble_disagreement": _disagree,
+                    "recommendation": "Human review recommended; treat the score as "
+                                      "evidence level, not a conclusion.",
+                }
+
+        # ── METRICS LOG [Fase-2 F.3 KPIs] ────────────────────────────────────
+        # One JSON line per analysis when METRICS_LOG_PATH is set: feeds the
+        # %-Inconclusive, disagreement and drift dashboards without a new service.
+        _metrics_path = _os.getenv("METRICS_LOG_PATH", "")
+        if _metrics_path:
+            try:
+                import time as _time
+                _fused = additional.get("fusion") or {}
+                with open(_metrics_path, "a", encoding="utf-8") as _mf:
+                    _mf.write(json.dumps({
+                        "ts": round(_time.time(), 1),
+                        "verdict": verdict,
+                        "probability": round(float(overall_score), 4),
+                        "calibrated": bool(_fused.get("calibrated", False)),
+                        "fusion_source": _fused.get("source"),
+                        "disagreement": float(getattr(detection_result, "ensemble_disagreement", 0.0) or 0.0) if detection_result else None,
+                        "word_count": len(text.split()) if text else 0,
+                        "uncertainty_reason": (additional.get("verdict_uncertainty") or {}).get("reason"),
+                    }) + "\n")
+            except Exception as _mexc:
+                logger.debug("Metrics log write failed: %s", _mexc)
 
         # [FIX v3.7] Now collect evidence AFTER all analyses are complete
         evidence_points = self._collect_evidence(sentence_attrs, additional)
@@ -2177,6 +2291,16 @@ Semantic Scholar, and OpenAlex. Score = best Levenshtein match (100 = exact).</p
             verdict_score_line = f"AI Score: {report.confidence*100:.1f}%"
         elif "Human" in report.verdict:
             verdict_score_line = f"Human Score: {(1-report.confidence)*100:.1f}%"
+        elif "Hybrid" in report.verdict and report.hybrid_analysis:
+            # [Fase-2 M-17] A single global % misleads for mixed authorship — show the
+            # composition (AI word share + transition count) instead.
+            _fv = report.hybrid_analysis.get("feature_vector", {}) or {}
+            _ai_share = float(_fv.get("ai_segment_ratio", 0.0)) * 100
+            _bp = int(_fv.get("breakpoint_count", 0))
+            verdict_score_line = (
+                f"AI sections: {_ai_share:.0f}% of words &nbsp;|&nbsp; "
+                f"{_bp} authorship transition{'s' if _bp != 1 else ''}"
+            )
         else:
             verdict_score_line = (f"Human Score: {(1-report.confidence)*100:.1f}%"
                                   f" &nbsp;|&nbsp; AI Score: {report.confidence*100:.1f}%")

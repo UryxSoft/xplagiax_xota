@@ -13,7 +13,14 @@
       "Bash(xargs -n1 basename)",
       "Bash(.venv/bin/python -m py_compile app/engine/authorship_consistency.py app/engine/discourse_analyzer.py app/engine/semantic_consistency.py app/plugins/author_signature.py app/plugins/discourse_structure.py app/plugins/semantic_consistency.py app/engine/fusion.py app/engine/plugin_orchestrator.py app/plugins/full_analysis.py)",
       "Bash(.venv/bin/python -)",
-      "Bash(.venv/bin/python -m py_compile app/engine/authorship_consistency.py app/engine/discourse_analyzer.py app/engine/semantic_consistency.py app/plugins/author_signature.py app/plugins/discourse_structure.py app/plugins/semantic_consistency.py app/plugins/full_analysis.py app/engine/fusion.py app/engine/plugin_orchestrator.py app/routes.py)"
+      "Bash(.venv/bin/python -m py_compile app/engine/authorship_consistency.py app/engine/discourse_analyzer.py app/engine/semantic_consistency.py app/plugins/author_signature.py app/plugins/discourse_structure.py app/plugins/semantic_consistency.py app/plugins/full_analysis.py app/engine/fusion.py app/engine/plugin_orchestrator.py app/routes.py)",
+      "Bash(git -C /Users/user/Documents/xplagiax_xota log --oneline -20)",
+      "Bash(git -C /Users/user/Documents/xplagiax_xota log --oneline main..auditoria-cientifica-fase1)",
+      "Bash(.venv/bin/python -m pytest tests/test_fusion_calibration.py tests/test_lang_semantic.py tests/test_model_shapes.py -q)",
+      "Bash(.venv/bin/python -m pytest tests/ -q)",
+      "Bash(git stash *)",
+      "Bash(.venv/bin/python -m pytest tests/test_engine.py::TestSplitSentences::test_abbreviation_not_split tests/test_plugins.py::test_auth_passes_when_api_key_empty tests/test_routes.py::test_health_returns_200 -q)",
+      "Bash(RUN_MODEL_SMOKE=1 .venv/bin/python -m pytest tests/test_model_shapes.py -q)"
     ]
   }
 }

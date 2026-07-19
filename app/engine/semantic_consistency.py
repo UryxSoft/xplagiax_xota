@@ -43,11 +43,30 @@ _MIN_SENTENCES = 4
 _OVERLAP_MIN = 0.5          # Jaccard of content words for "same topic"
 _MIN_CONTENT_WORDS = 4      # ignore very short sentences (unreliable overlap)
 
-_NEGATION_CUES = (
-    "not", "no", "never", "cannot", "n't", "without", "none", "nobody",
-    "nothing", "neither", "nor", "fails", "fail", "lacks", "lack", "absent",
-    "unable", "impossible", "false", "incorrect",
-)
+# [Fase-2 M-18] Per-language negation cues (en/es/fr/pt); unsupported → en.
+_NEGATION_CUES_BY_LANG = {
+    "en": (
+        "not", "no", "never", "cannot", "n't", "without", "none", "nobody",
+        "nothing", "neither", "nor", "fails", "fail", "lacks", "lack", "absent",
+        "unable", "impossible", "false", "incorrect",
+    ),
+    "es": (
+        "no", "nunca", "jamás", "sin", "ningún", "ninguna", "ninguno", "nadie",
+        "nada", "tampoco", "incapaz", "imposible", "falso", "falsa", "incorrecto",
+        "incorrecta", "carece", "carecen", "ausente",
+    ),
+    "fr": (
+        "ne", "pas", "jamais", "sans", "aucun", "aucune", "personne", "rien",
+        "non", "ni", "incapable", "impossible", "faux", "fausse", "incorrect",
+        "incorrecte", "absent", "absente",
+    ),
+    "pt": (
+        "não", "nunca", "jamais", "sem", "nenhum", "nenhuma", "ninguém", "nada",
+        "tampouco", "incapaz", "impossível", "falso", "falsa", "incorreto",
+        "incorreta", "carece", "carecem", "ausente",
+    ),
+}
+_NEGATION_CUES = _NEGATION_CUES_BY_LANG["en"]  # back-compat default
 
 _STOPWORDS: Set[str] = {
     "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "for", "with",
@@ -59,7 +78,8 @@ _STOPWORDS: Set[str] = {
     "had", "there", "here", "more", "most", "some", "any", "all", "into", "about",
 }
 
-_WORD_RE = re.compile(r"[A-Za-z']+|\d+(?:\.\d+)?", re.UNICODE)
+# [Fase-2 M-18] Accent-aware word regex so es/fr/pt content words are captured.
+_WORD_RE = re.compile(r"[a-záéíóúüñàâçèêëîïôùûœãõ']+|\d+(?:\.\d+)?", re.IGNORECASE | re.UNICODE)
 _NUM_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 
 
@@ -67,15 +87,27 @@ def _sentences(text: str) -> List[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
 
 
-def _content_words(sent: str) -> Set[str]:
+def _lang_stopwords(lang: str) -> Set[str]:
+    """Function-word set for content-word filtering; reuses lang_detect's lists."""
+    if lang == "en":
+        return _STOPWORDS
+    try:
+        from lang_detect import _STOPWORDS as _LD
+        return set(_LD.get(lang, ())) or _STOPWORDS
+    except Exception:
+        return _STOPWORDS
+
+
+def _content_words(sent: str, stopwords: Optional[Set[str]] = None) -> Set[str]:
+    sw = stopwords if stopwords is not None else _STOPWORDS
     return {w for w in (t.lower() for t in _WORD_RE.findall(sent))
-            if w not in _STOPWORDS and len(w) > 2}
+            if w not in sw and len(w) > 2}
 
 
-def _has_negation(sent: str) -> bool:
+def _has_negation(sent: str, cues=_NEGATION_CUES) -> bool:
     low = " " + sent.lower() + " "
     return any((cue if cue == "n't" else f" {cue} ") in (low if cue != "n't" else sent.lower())
-               for cue in _NEGATION_CUES)
+               for cue in cues)
 
 
 def _jaccard(a: Set[str], b: Set[str]) -> float:
@@ -121,7 +153,16 @@ class SemanticConsistencyAnalyzer:
         sents = sents[:_MAX_SENTENCES]
         use_nli = os.getenv("SEMANTIC_NLI", "0") == "1" and _get_nli() is not None
 
-        words = [_content_words(s) for s in sents]
+        # [Fase-2 M-18] Language-aware stopwords + negation cues (en/es/fr/pt).
+        try:
+            from lang_detect import detect_language
+            lang = detect_language(text).get("lang", "en")
+        except Exception:
+            lang = "en"
+        cues = _NEGATION_CUES_BY_LANG.get(lang, _NEGATION_CUES_BY_LANG["en"])
+        stopwords = _lang_stopwords(lang)
+
+        words = [_content_words(s, stopwords) for s in sents]
         contradictions: List[Dict[str, Any]] = []
 
         for i in range(len(sents)):
@@ -133,17 +174,25 @@ class SemanticConsistencyAnalyzer:
                 overlap = _jaccard(words[i], words[j])
                 if overlap < _OVERLAP_MIN:
                     continue
-                verdict = self._pair_contradicts(sents[i], sents[j], words[i], words[j], use_nli)
+                verdict = self._pair_contradicts(sents[i], sents[j], words[i], words[j],
+                                                 use_nli, cues)
                 if verdict is not None:
+                    reason, strong = verdict
                     contradictions.append({
                         "sentence_a": sents[i][:160],
                         "sentence_b": sents[j][:160],
                         "overlap": round(overlap, 3),
-                        "reason": verdict,
+                        "reason": reason,
+                        # [Fase-2 M-6] strong = numeric mismatch or NLI — specific enough
+                        # to feed the fusion. Negation-polarity flips are report-only
+                        # evidence (legitimate rhetorical contrast triggers them).
+                        "strong": strong,
                     })
 
         # Deduplicate overlapping reports (keep at most a handful for readability).
         ratio = min(1.0, len(contradictions) / len(sents))
+        strong_count = sum(1 for c in contradictions if c.get("strong"))
+        strong_ratio = min(1.0, strong_count / len(sents))
         if contradictions:
             level = "CONTRADICTIONS FOUND"
             interpretation = (
@@ -158,7 +207,10 @@ class SemanticConsistencyAnalyzer:
         return {
             "status": "ok",
             "method": "nli" if use_nli else "heuristic",
+            "language": lang,
             "contradiction_ratio": round(ratio, 4),
+            "strong_contradiction_ratio": round(strong_ratio, 4),
+            "strong_contradiction_count": strong_count,
             "contradiction_count": len(contradictions),
             "level": level,
             "interpretation": interpretation,
@@ -168,23 +220,26 @@ class SemanticConsistencyAnalyzer:
 
     # ── pair-level decision ──────────────────────────────────────────────────
     def _pair_contradicts(self, a: str, b: str, wa: Set[str], wb: Set[str],
-                          use_nli: bool) -> Optional[str]:
+                          use_nli: bool, cues=_NEGATION_CUES,
+                          ) -> Optional[Tuple[str, bool]]:
+        """Return (reason, strong) or None. strong=True only for numeric/NLI evidence."""
         if use_nli:
             label = self._nli_contradiction(a, b)
             if label is not None:
-                return label
+                return label, True
             # fall through to heuristic as a cheap second opinion
-        # Heuristic 1: negation-polarity flip on shared topic.
-        neg_a, neg_b = _has_negation(a), _has_negation(b)
-        if neg_a != neg_b:
-            return "negation polarity flip on shared content"
-        # Heuristic 2: same subject, different number.
+        # Heuristic 2 first: same subject, different number (specific → strong).
         nums_a = set(_NUM_RE.findall(a))
         nums_b = set(_NUM_RE.findall(b))
         if nums_a and nums_b and nums_a != nums_b and (wa & wb):
             shared = (wa & wb) - {n for n in nums_a | nums_b}
             if len(shared) >= _MIN_CONTENT_WORDS:
-                return f"numeric mismatch ({sorted(nums_a)} vs {sorted(nums_b)}) on shared subject"
+                return (f"numeric mismatch ({sorted(nums_a)} vs {sorted(nums_b)}) "
+                        f"on shared subject"), True
+        # Heuristic 1: negation-polarity flip on shared topic (noisy → weak, report-only).
+        neg_a, neg_b = _has_negation(a, cues), _has_negation(b, cues)
+        if neg_a != neg_b:
+            return "negation polarity flip on shared content", False
         return None
 
     def _nli_contradiction(self, a: str, b: str) -> Optional[str]:

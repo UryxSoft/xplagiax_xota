@@ -66,7 +66,7 @@ def test_extracts_plugin_features():
     det = _det(70, 30, stats={"burstiness": 0.1, "lexical_diversity": 0.5,
                               "avg_sentence_length": 18.0})
     d = FusionFeatureBuilder().build(det, additional).as_dict()
-    assert d["ppl_proxy_mean"] == pytest.approx(3.2)
+    assert d["ppl_proxy_mean"] == pytest.approx(3.2 / 15.0)  # M-12: [1,15] scale → [0,1]
     assert d["rsn_backtracking"] == pytest.approx(0.07)
     assert d["hal_semantic_incoherence"] == pytest.approx(0.7)
     assert d["hyb_global_ai"] == pytest.approx(0.80)          # 80/100
@@ -181,6 +181,134 @@ def test_temperature_scaling_reduces_ece():
     assert ts.temperature > 1.0                  # softening an over-confident model
     assert ece_after < ece_before
     assert ece_after < 0.03
+
+
+# ── Fase-2 heuristic-fusion safety (N-01/N-02/M-4/M-5/M-21) ─────────────────
+
+def _formal_human_signals():
+    """Genre-correlated signals a formal human academic essay plausibly triggers."""
+    return {
+        "discourse_structure": {"uniformity": 0.6},
+        "reasoning": {"feature_values": {"cot_scaffold_density": 0.5,
+                                         "backtracking_density": 0.3}},
+        "hallucination": {"overall_risk": 0.5},
+        "semantic_consistency": {"strong_contradiction_ratio": 0.2},
+    }
+
+
+def test_formal_human_not_flipped_to_ai():
+    """N-01: accumulated genre-correlated heuristics must NOT flip an 80%-human
+    neural verdict to AI-Generated (the Fase-2 flip pathway)."""
+    clf = FusionClassifier()
+    res = clf.predict_proba(_det(20, 80), _formal_human_signals())
+    assert res.probability < 0.5
+
+
+def test_corroboration_rule_caps_single_family():
+    """M-1: a single active family gets the reduced positive budget (≤ 0.35)."""
+    clf = FusionClassifier()
+    res = clf.predict_proba(_det(50, 50), {
+        "discourse_structure": {"uniformity": 1.0},
+        "reasoning": {"feature_values": {"cot_scaffold_density": 1.0,
+                                         "backtracking_density": 1.0}},
+    })
+    adj = res.contributions["_adjustment_clamped"]
+    assert adj <= 0.35 + 1e-9
+    assert res.contributions["_active_families"] == 1.0
+
+
+def test_reference_evidence_corroborates_alone():
+    """M-1: external ground truth (fabricated citations) unlocks the full budget."""
+    clf = FusionClassifier()
+    res = clf.predict_proba(_det(50, 50), {
+        "reference_check": {"feature_values": {"fabricated_ratio": 1.0}},
+    })
+    assert res.contributions["_active_families"] >= 2.0
+    assert res.contributions["_adjustment_clamped"] == pytest.approx(0.6)
+
+
+def test_hyb_ai_ratio_removed_from_adjustment():
+    """N-02: the hybrid-segment ratio comes from the SAME neural ensemble — it must
+    stay in the vector but never move the heuristic score."""
+    clf = FusionClassifier()
+    base = clf.predict_proba(_det(60, 40), {}).probability
+    with_hyb = clf.predict_proba(_det(60, 40), {
+        "hybrid_segment": {"global_ai_score": 100.0,
+                           "feature_vector": {"ai_segment_ratio": 1.0}},
+    }).probability
+    assert with_hyb == pytest.approx(base)
+
+
+def test_language_gate_excludes_english_lexicon_features():
+    """M-5/M-18: only the EN-regex reasoning features are gated on non-English text
+    (discourse/semantic carry their own es/fr/pt lexicons and stay active)."""
+    clf = FusionClassifier()
+    signals = {"reasoning": {"feature_values": {"cot_scaffold_density": 0.5,
+                                                "backtracking_density": 0.3}}}
+    en = clf.predict_proba(_det(50, 50), {**signals,
+                                          "language": {"lang": "en"}})
+    es = clf.predict_proba(_det(50, 50), {**signals,
+                                          "language": {"lang": "es"}})
+    assert es.probability < en.probability  # gated features no longer push toward AI
+    assert "rsn_cot_scaffold_excluded_lang" in es.contributions
+    assert "rsn_cot_scaffold" in en.contributions
+
+
+def test_pro_human_terms_temper_score():
+    """M-4: organic-writing stylometry (burstiness, hapax) pushes toward human."""
+    clf = FusionClassifier()
+    base = clf.predict_proba(_det(60, 40), {}).probability
+    human_style = clf.predict_proba(
+        _det(60, 40, stats={"burstiness": 0.9, "hapax_legomena_ratio": 0.8}), {},
+    ).probability
+    assert human_style < base
+
+
+def test_contributions_are_surfaced():
+    """M-21/N-15: per-term log-odds contributions must reach the output dict."""
+    clf = FusionClassifier()
+    res = clf.predict_proba(_det(70, 30), {
+        "reference_check": {"feature_values": {"fabricated_ratio": 0.5}},
+    })
+    d = res.to_dict()
+    assert "contributions" in d and d["contributions"]
+    assert "neural_softened" in d["contributions"]
+    assert d["contributions"]["ref_fabricated_ratio"] > 0
+
+
+def test_weights_roundtrip_and_env_loading(tmp_path, monkeypatch):
+    """M-19 wiring: trained weights persist to JSON and get_fusion_classifier
+    loads them (calibrated logistic) when FUSION_WEIGHTS_PATH is set."""
+    pytest.importorskip("sklearn")
+    import json
+    import fusion as fusion_mod
+    from calibration import TemperatureScaler
+
+    rng = np.random.default_rng(5)
+    n = 300
+    X = rng.normal(0, 1, (n, FUSION_VECTOR_DIM))
+    y = (X[:, FEATURE_NAMES.index("neural_ai_prob")] > 0).astype(int)
+    clf = FusionClassifier().fit(X, y)
+    clf.attach_calibrator(TemperatureScaler(temperature=1.5, fitted=True))
+
+    path = tmp_path / "fusion_weights.json"
+    path.write_text(json.dumps(clf.to_payload()))
+
+    monkeypatch.setenv("FUSION_WEIGHTS_PATH", str(path))
+    monkeypatch.setattr(fusion_mod, "_shared_fusion", None)  # reset singleton
+    loaded = fusion_mod.get_fusion_classifier()
+    assert loaded.is_trained
+    res = loaded.predict_proba_vec(X[0])
+    assert res.source == "logistic"
+    assert res.calibrated is True
+
+    # Schema-drift protection: wrong feature list must be refused.
+    bad = clf.to_payload()
+    bad["feature_names"] = bad["feature_names"][:-1]
+    with pytest.raises(ValueError, match="schema mismatch"):
+        FusionClassifier().load_payload(bad)
+
+    monkeypatch.setattr(fusion_mod, "_shared_fusion", None)  # don't leak to other tests
 
 
 def test_calibrator_attaches_to_fusion():

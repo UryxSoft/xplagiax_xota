@@ -29,20 +29,71 @@ import re
 from typing import Any, Dict, List
 
 # ── Discourse-marker lexicons ────────────────────────────────────────────────
-_TRANSITION_MARKERS = (
-    "however", "moreover", "furthermore", "additionally", "consequently",
-    "therefore", "thus", "nevertheless", "nonetheless", "in addition",
-    "on the other hand", "in contrast", "for instance", "for example",
-    "as a result", "in particular", "notably", "importantly", "subsequently",
-)
-_ENUMERATION_MARKERS = (
-    "firstly", "secondly", "thirdly", "fourthly", "finally", "lastly",
-    "first of all", "to begin with", "next", "then",
-)
-_CONCLUSION_MARKERS = (
-    "in conclusion", "in summary", "to summarize", "to summarise",
-    "overall", "in essence", "ultimately", "to conclude", "all in all",
-)
+# [Fase-2 M-18] Per-language marker sets (en/es/fr/pt). The analyzer picks the set
+# matching the detected document language; unsupported languages fall back to "en"
+# (the fusion's language gate handles the residual mismatch).
+_TRANSITION_MARKERS = {
+    "en": (
+        "however", "moreover", "furthermore", "additionally", "consequently",
+        "therefore", "thus", "nevertheless", "nonetheless", "in addition",
+        "on the other hand", "in contrast", "for instance", "for example",
+        "as a result", "in particular", "notably", "importantly", "subsequently",
+    ),
+    "es": (
+        "sin embargo", "además", "asimismo", "por lo tanto", "por consiguiente",
+        "no obstante", "en cambio", "por el contrario", "por ejemplo",
+        "en particular", "en consecuencia", "de hecho", "por otro lado",
+        "por otra parte", "cabe destacar", "posteriormente", "igualmente",
+    ),
+    "fr": (
+        "cependant", "de plus", "en outre", "par conséquent", "néanmoins",
+        "toutefois", "en revanche", "par contre", "par exemple", "notamment",
+        "ainsi", "donc", "d'ailleurs", "en effet", "par la suite", "également",
+    ),
+    "pt": (
+        "no entanto", "além disso", "portanto", "consequentemente", "contudo",
+        "todavia", "em contrapartida", "por outro lado", "por exemplo",
+        "em particular", "de fato", "aliás", "assim", "posteriormente", "igualmente",
+    ),
+}
+_ENUMERATION_MARKERS = {
+    "en": (
+        "firstly", "secondly", "thirdly", "fourthly", "finally", "lastly",
+        "first of all", "to begin with", "next", "then",
+    ),
+    "es": (
+        "en primer lugar", "en segundo lugar", "en tercer lugar", "primero",
+        "segundo", "tercero", "finalmente", "por último", "a continuación",
+        "para empezar", "luego",
+    ),
+    "fr": (
+        "premièrement", "deuxièmement", "troisièmement", "d'abord",
+        "tout d'abord", "ensuite", "enfin", "pour commencer", "puis",
+    ),
+    "pt": (
+        "primeiramente", "em primeiro lugar", "em segundo lugar",
+        "em terceiro lugar", "finalmente", "por fim", "por último",
+        "em seguida", "para começar", "depois",
+    ),
+}
+_CONCLUSION_MARKERS = {
+    "en": (
+        "in conclusion", "in summary", "to summarize", "to summarise",
+        "overall", "in essence", "ultimately", "to conclude", "all in all",
+    ),
+    "es": (
+        "en conclusión", "en resumen", "para concluir", "en síntesis",
+        "en definitiva", "en suma", "a modo de conclusión",
+    ),
+    "fr": (
+        "en conclusion", "en résumé", "pour conclure", "en somme",
+        "en définitive", "au final",
+    ),
+    "pt": (
+        "em conclusão", "em resumo", "para concluir", "em síntese",
+        "em suma", "por fim",
+    ),
+}
 
 # Heuristic saturation scales — value/scale clipped to 1.0 (declared uncalibrated).
 _TRANSITION_SCALE = 0.45     # transitions per sentence at which the feature saturates
@@ -97,6 +148,18 @@ class DiscourseAnalyzer:
         paras = _paragraphs(text)
         n_sent = max(len(sents), 1)
 
+        # [Fase-2 M-18] Pick the marker lexicon matching the document language.
+        try:
+            from lang_detect import detect_language
+            lang = detect_language(text).get("lang", "en")
+        except Exception:
+            lang = "en"
+        if lang not in _TRANSITION_MARKERS:
+            lang = "en"
+        transition_set = _TRANSITION_MARKERS[lang]
+        enumeration_set = _ENUMERATION_MARKERS[lang]
+        conclusion_set = _CONCLUSION_MARKERS[lang]
+
         if len(sents) < 4:
             return {
                 "status": "inconclusive",
@@ -106,7 +169,7 @@ class DiscourseAnalyzer:
             }
 
         # 1) Connective density — formal transitions per sentence.
-        trans_hits = _count_markers(low, _TRANSITION_MARKERS)
+        trans_hits = _count_markers(low, transition_set)
         connective_density = _clip01((len(trans_hits) / n_sent) / _TRANSITION_SCALE)
 
         # 2) Paragraph uniformity — low coefficient-of-variation of paragraph word counts.
@@ -123,7 +186,7 @@ class DiscourseAnalyzer:
             paragraph_uniformity = 0.0  # too few paragraphs to judge
 
         # 3) Enumeration scaffolding — ordinal words + numbered/bulleted list lead-ins.
-        enum_hits = _count_markers(low, _ENUMERATION_MARKERS)
+        enum_hits = _count_markers(low, enumeration_set)
         numbered = len(re.findall(r"(?m)^\s*(?:\d+[.)]|[-*•])\s+", text))
         enumeration_scaffold = _clip01(
             0.6 * (len(enum_hits) / _ENUMERATION_SCALE)
@@ -143,7 +206,7 @@ class DiscourseAnalyzer:
             opening_repetition = 0.0
 
         # 5) Conclusion marker — explicit summarising closer present.
-        concl_hits = _count_markers(low, _CONCLUSION_MARKERS)
+        concl_hits = _count_markers(low, conclusion_set)
         conclusion_marker = 1.0 if concl_hits else 0.0
 
         features = {
@@ -178,6 +241,7 @@ class DiscourseAnalyzer:
 
         return {
             "status": "ok",
+            "language": lang,
             "uniformity": uniformity,
             "level": level,
             "interpretation": interpretation,
