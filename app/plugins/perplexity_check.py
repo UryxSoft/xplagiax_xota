@@ -18,12 +18,11 @@ _classifier = None
 _available = False
 
 try:
-    from app.engine.perplexity_profiler import PerplexityProfiler, PerplexityRiskClassifier
-    _profiler = PerplexityProfiler(
-        ngram_dict_path=os.getenv("PERPLEXITY_DICT_PATH"),
-        enable_tier2=os.getenv("PERPLEXITY_TIER2", "1") == "1",
-    )
-    _classifier = PerplexityRiskClassifier()
+    # [C1] Shared singletons — get_perplexity_profiler() reads the same env vars
+    # (PERPLEXITY_DICT_PATH, PERPLEXITY_TIER2) this module previously read itself.
+    from app.engine.engines import get_perplexity_profiler, get_perplexity_classifier
+    _profiler = get_perplexity_profiler()
+    _classifier = get_perplexity_classifier()
     _available = True
 
     logger.info("PerplexityProfiler loaded (%s)", _profiler.tier)

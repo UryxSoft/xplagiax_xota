@@ -17,10 +17,10 @@ _classifier = None
 _available = False
 
 try:
-    from app.engine.reasoning_profiler import ReasoningProfiler
-    from app.engine.forensic_reports import ReasoningRiskClassifier
-    _profiler = ReasoningProfiler()
-    _classifier = ReasoningRiskClassifier()
+    # [C1] Shared singletons — same instances the orchestrator (full_analysis) uses.
+    from app.engine.engines import get_reasoning_profiler, get_reasoning_classifier
+    _profiler = get_reasoning_profiler()
+    _classifier = get_reasoning_classifier()
     _available = True
     logger.info("ReasoningProfiler + Classifier loaded")
 except Exception as exc:

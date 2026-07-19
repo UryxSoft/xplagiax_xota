@@ -19,6 +19,19 @@ import os
 import multiprocessing
 import sys
 import threading
+
+# ── [C6] CPU pool caps — MUST be set before the app (and torch) load ──
+# Parallelism already comes from gunicorn workers × threads × the plugin
+# executor (PLUGIN_MAX_WORKERS) × inference batching. If each BLAS/OpenMP
+# runtime also spawns one thread per core, the box runs cores² runnable
+# threads and p99 latency blows up on context switches. torch's own intra-op
+# cap (TORCH_NUM_THREADS, detector_final.py) covers torch kernels; these
+# cover numpy/scipy/spacy BLAS calls. setdefault → any explicit env wins.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 # ── Server socket ─────────────────────────────────────────────────
 bind = os.getenv("GUNICORN_BIND", "0.0.0.0:5006")
 

@@ -33,8 +33,6 @@ Plugin call map
   PerplexityProfiler            .compute_stats(text)  [NEW v3.7]
   PerplexityRiskClassifier      .classify(stats)      [NEW v3.7]
   HybridSegmentAnalyzer         .analyze(text)        [NEW v3.9]
-  ReferenceValidator            .compute_stats(text)  [NEW v3.9]
-  ReferenceRiskClassifier       .classify(stats)      [NEW v3.9]
   WatermarkDecoder              .detect(text) -> .to_forensic_dict()
   ForensicReportGenerator       .generate_report(...) -> .export_html/json()
 
@@ -112,7 +110,6 @@ class PluginConfig:
     enable_reasoning:       bool = True
     enable_perplexity:      bool = True     # [NEW v3.7] Perplexity profiler
     enable_hybrid_segment:  bool = True     # [NEW v3.9] Per-paragraph heatmap
-    enable_reference_check: bool = False    # [NEW v3.9] Citation validator (requires network)
     enable_author_signature: bool = True    # [Tier1] Intra-document authorship consistency
     enable_discourse:        bool = True    # [Tier1] Discourse-structure uniformity (model-agnostic)
     enable_semantic_consistency: bool = True  # [Tier1] Internal-contradiction detection
@@ -123,7 +120,10 @@ class PluginConfig:
     watermark_device:       Optional[str] = None
     perplexity_dict_path:   Optional[str] = None   # [NEW v3.7] Pre-built n-gram dict
     perplexity_tier2:       bool = True             # [NEW v3.7] Auto-enable GPT-2
-    reference_network:      bool = True             # [NEW v3.9] Call CrossRef/S2/OpenAlex APIs
+    # [REMOVED] enable_reference_check / reference_network — the network-bound
+    # citation validator added 200-800 ms of sequential HTTP per request for a
+    # signal with no measured precision gain (enshittification audit: remove
+    # slow, low-value plugins rather than keep them "optional").
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -175,8 +175,6 @@ class PluginOrchestrator:
         self._perplexity_profiler:      Any = None      # [NEW v3.7]
         self._perplexity_classifier:    Any = None      # [NEW v3.7]
         self._hybrid_analyzer:          Any = None      # [NEW v3.9]
-        self._reference_validator:      Any = None      # [NEW v3.9]
-        self._reference_classifier:     Any = None      # [NEW v3.9]
         self._discourse_analyzer:       Any = None      # [Tier1]
         self._semantic_analyzer:        Any = None      # [Tier1]
         self._watermark_decoder:        Any = None
@@ -184,107 +182,82 @@ class PluginOrchestrator:
         self._init_plugins()
 
     def _init_plugins(self) -> None:
-        """Load each enabled plugin once. Import failures are logged and skipped."""
+        """Wire each enabled engine once. Import failures are logged and skipped.
+
+        [C1 FIX] Engines are obtained from the shared singleton factories in
+        engines.py instead of being constructed here. The thin HTTP plugins in
+        app/plugins/ use the same factories, so a process holds exactly ONE
+        StylometricProfiler, ONE PerplexityProfiler, etc., no matter how many
+        entry points are active.
+        """
         cfg = self.config
+        import engines
 
         if cfg.enable_stylometric:
             try:
-                from stylometric_profiler import StylometricProfiler
-                self._stylometric = StylometricProfiler()
-                logger.info("StylometricProfiler loaded")
-            except ImportError as exc:
+                self._stylometric = engines.get_stylometric()
+                logger.info("StylometricProfiler wired (shared)")
+            except Exception as exc:
                 logger.warning("StylometricProfiler unavailable: %s", exc)
 
         if cfg.enable_hallucination:
             try:
-                from hallucination_profile import (
-                    HallucinationProfiler,
-                    HallucinationRiskClassifier,
-                )
-                self._hallucination_profiler   = HallucinationProfiler()
-                self._hallucination_classifier = HallucinationRiskClassifier()
-                logger.info("HallucinationProfiler + Classifier loaded")
-            except ImportError as exc:
+                self._hallucination_profiler   = engines.get_hallucination_profiler()
+                self._hallucination_classifier = engines.get_hallucination_classifier()
+                logger.info("HallucinationProfiler + Classifier wired (shared)")
+            except Exception as exc:
                 logger.warning("HallucinationProfiler unavailable: %s", exc)
 
         if cfg.enable_reasoning:
             try:
-                from reasoning_profiler import ReasoningProfiler
-                self._reasoning_profiler = ReasoningProfiler()
-                logger.info("ReasoningProfiler loaded")
-            except ImportError as exc:
+                self._reasoning_profiler = engines.get_reasoning_profiler()
+                logger.info("ReasoningProfiler wired (shared)")
+            except Exception as exc:
                 logger.warning("ReasoningProfiler unavailable: %s", exc)
 
-            # [NEW v3.5] Load ReasoningRiskClassifier for full analysis
+            # [NEW v3.5] ReasoningRiskClassifier for full analysis
             try:
-                from forensic_reports import ReasoningRiskClassifier
-                self._reasoning_classifier = ReasoningRiskClassifier()
-                logger.info("ReasoningRiskClassifier loaded")
-            except ImportError as exc:
+                self._reasoning_classifier = engines.get_reasoning_classifier()
+                logger.info("ReasoningRiskClassifier wired (shared)")
+            except Exception as exc:
                 logger.warning("ReasoningRiskClassifier unavailable: %s", exc)
 
         if cfg.enable_watermark:
             try:
-                import torch
-                from watermark_decoder import WatermarkDecoder
-                device = torch.device(cfg.watermark_device) if cfg.watermark_device else None
-                self._watermark_decoder = WatermarkDecoder(device=device)
-                logger.info("WatermarkDecoder loaded")
-            except ImportError as exc:
+                self._watermark_decoder = engines.get_watermark_decoder(cfg.watermark_device)
+                logger.info("WatermarkDecoder wired (shared)")
+            except Exception as exc:
                 logger.warning("WatermarkDecoder unavailable: %s", exc)
 
         # [NEW v3.7] PerplexityProfiler + PerplexityRiskClassifier
         if cfg.enable_perplexity:
             try:
-                from perplexity_profiler import PerplexityProfiler, PerplexityRiskClassifier
-                self._perplexity_profiler = PerplexityProfiler(
-                    ngram_dict_path=cfg.perplexity_dict_path,
-                    enable_tier2=cfg.perplexity_tier2,
-                )
-                self._perplexity_classifier = PerplexityRiskClassifier()
+                self._perplexity_profiler = engines.get_perplexity_profiler()
+                self._perplexity_classifier = engines.get_perplexity_classifier()
                 tier = getattr(self._perplexity_profiler, "tier", "tier1")
-                logger.info("PerplexityProfiler loaded (%s)", tier)
-            except ImportError as exc:
+                logger.info("PerplexityProfiler wired (shared, %s)", tier)
+            except Exception as exc:
                 logger.warning("PerplexityProfiler unavailable: %s", exc)
 
         # [NEW v3.9] HybridSegmentAnalyzer — per-paragraph AI/human heatmap
         if cfg.enable_hybrid_segment:
             try:
-                from hybrid_segment_detector import HybridSegmentAnalyzer
-                from detector_final import classify_batch, classify_segment
-                self._hybrid_analyzer = HybridSegmentAnalyzer(
-                    classify_fn=classify_segment,
-                    classify_batch_fn=classify_batch,
-                )
-                logger.info("HybridSegmentAnalyzer loaded")
-            except ImportError as exc:
+                self._hybrid_analyzer = engines.get_hybrid_analyzer()
+                logger.info("HybridSegmentAnalyzer wired (shared)")
+            except Exception as exc:
                 logger.warning("HybridSegmentAnalyzer unavailable: %s", exc)
-
-        # [NEW v3.9] ReferenceValidator + ReferenceRiskClassifier
-        if cfg.enable_reference_check:
-            try:
-                from reference_validator import ReferenceValidator, ReferenceRiskClassifier
-                self._reference_validator = ReferenceValidator(
-                    enable_network=cfg.reference_network,
-                )
-                self._reference_classifier = ReferenceRiskClassifier()
-                logger.info("ReferenceValidator loaded (network=%s)", cfg.reference_network)
-            except ImportError as exc:
-                logger.warning("ReferenceValidator unavailable: %s", exc)
 
         if cfg.enable_discourse:
             try:
-                from discourse_analyzer import DiscourseAnalyzer
-                self._discourse_analyzer = DiscourseAnalyzer()
-                logger.info("DiscourseAnalyzer loaded")
+                self._discourse_analyzer = engines.get_discourse_analyzer()
+                logger.info("DiscourseAnalyzer wired (shared)")
             except Exception as exc:  # noqa: BLE001 — pure-Python, but stay defensive
                 logger.warning("DiscourseAnalyzer unavailable: %s", exc)
 
         if cfg.enable_semantic_consistency:
             try:
-                from semantic_consistency import SemanticConsistencyAnalyzer
-                self._semantic_analyzer = SemanticConsistencyAnalyzer()
-                logger.info("SemanticConsistencyAnalyzer loaded")
+                self._semantic_analyzer = engines.get_semantic_analyzer()
+                logger.info("SemanticConsistencyAnalyzer wired (shared)")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("SemanticConsistencyAnalyzer unavailable: %s", exc)
 
@@ -398,6 +371,26 @@ class PluginOrchestrator:
                 degraded.append("reasoning")
                 logger.warning("ReasoningProfiler.vectorize() failed: %s", exc)
 
+        # ── HallucinationProfiler ─────────────────────────────────────
+        # [C4 FIX] Surface the hallucination analysis in additional_analyses so the
+        # late-fusion classifier can actually consume it. Previously the profiler was
+        # only passed to ForensicReportGenerator, so fusion's hal_* features
+        # (overall_risk, category_scores) were always 0 — a signal the fusion claimed
+        # to use but never received.
+        if (self._hallucination_profiler is not None
+                and self._hallucination_classifier is not None):
+            try:
+                hal_stats = self._hallucination_profiler.compute_stats(text)
+                hal_analysis = self._hallucination_classifier.classify(hal_stats)
+                additional["hallucination"] = hal_analysis
+                logger.debug(
+                    "Hallucination: overall_risk=%.4f level=%s",
+                    hal_analysis.get("overall_risk", 0.0),
+                    hal_analysis.get("risk_level", "N/A"),
+                )
+            except Exception as exc:
+                logger.warning("HallucinationProfiler.compute_stats() failed: %s", exc)
+
         # ── PerplexityProfiler [NEW v3.7] ─────────────────────────────
         if self._perplexity_profiler is not None:
             try:
@@ -445,48 +438,6 @@ class PluginOrchestrator:
             except Exception as exc:
                 degraded.append("hybrid_segment")
                 logger.warning("HybridSegmentAnalyzer.analyze() failed: %s", exc)
-
-        # ── ReferenceValidator [NEW v3.9] ─────────────────────────────
-        # [Fase-2 M-7] The strongest, most model-agnostic signal (external ground
-        # truth) stays OFF in the sync path (network latency), but activates in the
-        # ASYNC path where latency tolerance is high. The orchestrator is a preload
-        # singleton shared by both paths, so the switch is the per-thread execution
-        # context stamped by the Celery task — not an env var read at init.
-        if (self._reference_validator is None
-                and os.getenv("REFERENCE_CHECK_ASYNC", "1") == "1"):
-            try:
-                from exec_context import is_async
-                if is_async():
-                    self._ensure_reference_validator()
-            except Exception as exc:
-                logger.warning("Async reference-check activation failed: %s", exc)
-
-        if self._reference_validator is not None:
-            try:
-                ref_stats = self._reference_validator.compute_stats(text)
-
-                if self._reference_classifier is not None:
-                    ref_analysis = self._reference_classifier.classify(ref_stats)
-                    # Map validation_results to 'references' for HTML builder
-                    ref_analysis["references"] = ref_analysis.get("validation_results", [])
-                    ref_analysis["feature_values"] = {
-                        k: ref_stats[k] for k in ref_stats
-                        if isinstance(ref_stats[k], (int, float))
-                    }
-                    additional["reference_check"] = ref_analysis
-                else:
-                    additional["reference_check"] = ref_stats
-
-                logger.debug(
-                    "ReferenceValidator: score=%.4f level=%s refs=%d fabricated=%d",
-                    additional["reference_check"].get("ai_score", 0.0),
-                    additional["reference_check"].get("risk_level", "N/A"),
-                    ref_stats.get("total_references", 0),
-                    ref_stats.get("fabricated_count", 0),
-                )
-            except Exception as exc:
-                degraded.append("reference_check")
-                logger.warning("ReferenceValidator.compute_stats() failed: %s", exc)
 
         # ── WatermarkDecoder ──────────────────────────────────────────
         if self._watermark_decoder is not None:
@@ -595,25 +546,8 @@ class PluginOrchestrator:
             "forensic_report_path": forensic_report_path,
         }
 
-    # ── Lazy loaders ───────────────────────────────────────────────────
 
-    _ref_lock = threading.Lock()
 
-    def _ensure_reference_validator(self) -> None:
-        """[Fase-2 M-7] Load ReferenceValidator on first async use (thread-safe)."""
-        with self._ref_lock:
-            if self._reference_validator is not None:
-                return
-            try:
-                from reference_validator import ReferenceValidator, ReferenceRiskClassifier
-                self._reference_validator = ReferenceValidator(
-                    enable_network=self.config.reference_network,
-                )
-                self._reference_classifier = ReferenceRiskClassifier()
-                logger.info("ReferenceValidator lazily loaded for async path (network=%s)",
-                            self.config.reference_network)
-            except ImportError as exc:
-                logger.warning("ReferenceValidator unavailable: %s", exc)
 
     # ── Reasoning score helpers ────────────────────────────────────────
     # These exist solely because ReasoningProfiler produces a raw 15-dim
@@ -654,7 +588,6 @@ class PluginOrchestrator:
         if self._reasoning_classifier   is not None: active.append("ReasoningRiskClassifier")
         if self._perplexity_profiler    is not None: active.append("PerplexityProfiler")
         if self._hybrid_analyzer        is not None: active.append("HybridSegmentAnalyzer")
-        if self._reference_validator    is not None: active.append("ReferenceValidator")
         if self._watermark_decoder      is not None: active.append("WatermarkDecoder")
         if self._forensic_generator     is not None: active.append("ForensicReportGenerator")
         return active
@@ -717,14 +650,6 @@ class PluginOrchestrator:
                 f"paragraphs={hyb.get('total_paragraphs',0)}  "
                 f"windows={hyb.get('total_windows',0)}  "
                 f"breakpoints={hyb.get('breakpoint_count',0)}"]
-
-        ref = aa.get("reference_check")
-        if ref:
-            lines += ["", "  Reference Validation:",
-                f"    score={ref.get('ai_score',0):.4f}  level={ref.get('risk_level','N/A')}",
-                f"    total_refs={ref.get('feature_values',{}).get('total_references',0):.0f}  "
-                f"fabricated={ref.get('feature_values',{}).get('fabricated_count',0):.0f}  "
-                f"chimeric={ref.get('feature_values',{}).get('chimeric_count',0):.0f}"]
 
         wm = aa.get("watermark")
         if wm:

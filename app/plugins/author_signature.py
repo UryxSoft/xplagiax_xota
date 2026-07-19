@@ -38,9 +38,11 @@ except Exception as exc:  # noqa: BLE001
     logger.debug("author_embedding module not importable: %s", exc)
 
 try:
-    from app.engine.stylometric_profiler import StylometricProfiler
+    # [C1] Shared singleton — same StylometricProfiler as stylometric_analysis
+    # and the orchestrator (previously a third private instance lived here).
+    from app.engine.engines import get_stylometric
     from app.engine.authorship_consistency import compute_authorship_consistency
-    _profiler = StylometricProfiler()
+    _profiler = get_stylometric()
     _available = True
     logger.info("StylometricProfiler loaded for author_signature")
 except Exception as exc:  # noqa: BLE001 — degrade gracefully

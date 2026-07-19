@@ -113,16 +113,12 @@ _SMALL_LIST_THRESHOLD: int = 30
 # Optional spaCy (dependency-injected at class level)
 # ═══════════════════════════════════════════════════════════════════════════
 
-try:
-    import spacy as _spacy
-    _NLP = _spacy.load("en_core_web_sm")
-    _SPACY_AVAILABLE = True
-except ImportError:
-    _SPACY_AVAILABLE = False
-    _NLP = None
-except OSError:
-    _SPACY_AVAILABLE = False
-    _NLP = None
+# [C7 FIX] Use the shared spaCy singleton instead of loading a second copy of
+# en_core_web_sm (stylometric_profiler loads the same model). Same object, same
+# parses — only the duplicate memory is removed.
+from app.engine._nlp import get_nlp as _get_nlp, spacy_available as _spacy_available
+_NLP = _get_nlp()
+_SPACY_AVAILABLE = _spacy_available()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

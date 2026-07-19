@@ -47,6 +47,11 @@ WINDOW_OVERLAP: float = 0.50
 MIN_WINDOW_WORDS: int = 80
 MIN_PARAGRAPH_WORDS: int = 15
 
+# [C3] Windows are classified in batches of this size when a batch classifier is
+# injected — one tokenizer+ensemble call per batch instead of one per window.
+# Bounded so a very long document does not build a single oversized padded tensor.
+WINDOW_BATCH_SIZE: int = 12
+
 THRESHOLD_AI: float = 70.0
 THRESHOLD_UNCERTAIN: float = 30.0
 
@@ -215,6 +220,11 @@ class WindowClassifier:
         ] = None,
     ) -> None:
         self._classify_fn = classify_fn
+        # [C3] Optional batch classifier: classify_batch_fn(list[str]) -> list[(human%, ai%)].
+        # When provided, windows go through the ensemble in batches instead of one at a
+        # time. The per-window result is numerically identical (production classify_segment
+        # already delegates to classify_batch); this only removes the redundant
+        # tokenize+forward calls.
         self._classify_batch_fn = classify_batch_fn
 
     def classify_windows(
@@ -271,6 +281,25 @@ class WindowClassifier:
                         batch_scores.append((50.0, 50.0))
             scores.extend(batch_scores)
         return scores
+
+    def _classify_batch(self, window_texts: List[str]) -> List[Tuple[float, float]]:
+        """Classify all windows in bounded batches; fall back per-batch on failure."""
+        pairs: List[Tuple[float, float]] = []
+        for i in range(0, len(window_texts), WINDOW_BATCH_SIZE):
+            chunk = window_texts[i:i + WINDOW_BATCH_SIZE]
+            try:
+                batch_pairs = self._classify_batch_fn(chunk)
+            except Exception as exc:
+                logger.warning("Batch window classification failed (%d..%d): %s",
+                               i, i + len(chunk), exc)
+                batch_pairs = [(50.0, 50.0)] * len(chunk)
+            # Guard against a batch fn returning the wrong length
+            if len(batch_pairs) != len(chunk):
+                logger.warning("Batch classifier returned %d results for %d windows; "
+                               "padding with neutral scores", len(batch_pairs), len(chunk))
+                batch_pairs = (list(batch_pairs) + [(50.0, 50.0)] * len(chunk))[:len(chunk)]
+            pairs.extend(batch_pairs)
+        return pairs
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -484,11 +513,11 @@ class HybridSegmentAnalyzer:
     def __init__(
         self,
         classify_fn: Callable[[str], Tuple[float, float]],
-        classify_batch_fn: Optional[
-            Callable[[List[str]], List[Tuple[float, float]]]
-        ] = None,
+        classify_batch_fn: Optional[Callable[[List[str]], List[Tuple[float, float]]]] = None,
     ) -> None:
         self._segmenter = TextSegmenter()
+        # [C3] Pass through an optional batch classifier so all windows are scored in
+        # a few ensemble calls instead of one per window (same numbers, less latency).
         self._classifier = WindowClassifier(classify_fn, classify_batch_fn)
         self._mapper = ParagraphMapper()
         self._bp_detector = BreakpointDetector()
