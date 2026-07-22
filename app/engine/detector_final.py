@@ -512,6 +512,109 @@ def _cache_namespace() -> str:
 _CACHE_NS: str = _cache_namespace()
 
 
+# ── Document segmentation ────────────────────────────────────────────────────
+# Splitting on EVERY newline (the previous behaviour) made the unit of analysis
+# whatever the source happened to wrap at. Text extracted from a PDF carries a
+# newline at every visual line break, so each ~12-word fragment — cut mid
+# sentence — was classified as an independent document and rendered with its own
+# AI/human verdict. The same content pasted from a PDF reader (which rejoins
+# lines into paragraphs) segmented completely differently, so identical text
+# produced different results depending on how it arrived.
+#
+# Two extra casualties of splitting on "\n" first: the tokenizer's own
+# normalizer (join_hyphen_break / newline_to_space, above) can no longer rejoin
+# a word hyphenated across a line break, because the halves now live in separate
+# segments and it only ever sees one at a time.
+#
+# Rules below mirror FinderX's chunker (app/services/chunker.py), which already
+# solved this for search: collapse intra-paragraph newlines, cut on paragraph
+# then sentence boundaries, never mid-word, and merge undersized fragments.
+# Deliberately NOT copied: chunk overlap (would double-count text in the
+# token-weighted aggregate) and SimHash dedup (would drop legitimately repeated
+# paragraphs).
+_SEG_MIN_WORDS = int(os.getenv("SEGMENT_MIN_WORDS", "40"))
+_SEG_MAX_WORDS = int(os.getenv("SEGMENT_MAX_WORDS", "400"))
+
+_RE_HYPHEN_LINEBREAK = re.compile(r'(\w+)[-‐‑]\s*\n\s*(\w+)')
+_RE_INTRA_WS = re.compile(r'\s+')
+_RE_PARAGRAPH_SPLIT = re.compile(r'\n\s*\n')
+_RE_SENTENCE_FALLBACK = re.compile(r'(?<=[.!?])\s+')
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Sentence split via NLTK punkt, regex fallback if the corpus is missing."""
+    try:
+        from nltk.tokenize import sent_tokenize
+        parts = sent_tokenize(text)
+    except Exception:
+        parts = _RE_SENTENCE_FALLBACK.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def segment_document(
+    text: str,
+    min_words: int = _SEG_MIN_WORDS,
+    max_words: int = _SEG_MAX_WORDS,
+) -> List[str]:
+    """Split a document into analysis units of at least `min_words`.
+
+    1. Paragraphs = blank-line separated blocks. A lone "\\n" is intra-paragraph
+       wrapping, so it collapses to a space (words hyphenated across the break
+       are rejoined first) — this is what makes an uploaded PDF and the same
+       text pasted by hand segment identically.
+    2. A paragraph longer than `max_words` is cut on sentence boundaries, never
+       mid-sentence and never mid-word.
+    3. Fragments below `min_words` are merged forward until they reach it: a
+       10-word line carries no statistical signal for an AI/human verdict, and
+       rendering one with its own confidence badge is worse than not splitting
+       there at all. Trade-off: a very short paragraph is judged together with
+       its neighbour, so a lone AI sentence between human paragraphs can be
+       diluted. `min_words` tunes that (lower = finer, noisier).
+    """
+    if not text or not text.strip():
+        return []
+
+    raw: List[str] = []
+    for block in _RE_PARAGRAPH_SPLIT.split(text):
+        block = _RE_HYPHEN_LINEBREAK.sub(r'\1\2', block)
+        block = clean_text(_RE_INTRA_WS.sub(' ', block)).strip()
+        if not block:
+            continue
+        if len(block.split()) <= max_words:
+            raw.append(block)
+            continue
+        # Oversized paragraph: accumulate whole sentences up to max_words.
+        current: List[str] = []
+        current_words = 0
+        for sentence in _split_sentences(block):
+            n = len(sentence.split())
+            if current and current_words + n > max_words:
+                raw.append(' '.join(current))
+                current, current_words = [], 0
+            current.append(sentence)
+            current_words += n
+        if current:
+            raw.append(' '.join(current))
+
+    # Merge undersized fragments forward; a short tail folds into the previous.
+    merged: List[str] = []
+    buf: List[str] = []
+    buf_words = 0
+    for seg in raw:
+        buf.append(seg)
+        buf_words += len(seg.split())
+        if buf_words >= min_words:
+            merged.append(' '.join(buf))
+            buf, buf_words = [], 0
+    if buf:
+        tail = ' '.join(buf)
+        if merged:
+            merged[-1] = merged[-1] + ' ' + tail
+        else:
+            merged.append(tail)   # whole document below min_words — keep as one
+    return merged
+
+
 @torch.inference_mode()
 def analyze_fast(text: str) -> dict:
     """
@@ -547,12 +650,9 @@ def analyze_fast(text: str) -> dict:
     #    space, which destroys \n\n paragraph boundaries. Splitting first
     #    preserves the human/AI paragraph separation, then we clean each
     #    segment individually so the tokenizer receives normalised text.
-    segments_text: List[str] = []
-    for block in text.split('\n\n'):
-        for line in block.split('\n'):
-            line = clean_text(line).strip()
-            if line:
-                segments_text.append(line)
+    #    See segment_document(): paragraph/sentence aware, with a minimum size,
+    #    so the unit of analysis no longer depends on where the source wrapped.
+    segments_text: List[str] = segment_document(text)
     if not segments_text:
         segments_text = [clean_text(text).strip()]
 
