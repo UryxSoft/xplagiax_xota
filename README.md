@@ -106,7 +106,7 @@ Client
 | Non-root container user | UID 1000, K8s security best practice |
 | `m.share_memory()` wrapped in try/except | Silently falls back to anon CoW if `/dev/shm` is too small — prevents import failure |
 | Celery `--pool=threads --concurrency=2` | 2 concurrent analyses in the same process — shares models, no memory duplication, PyTorch releases GIL during inference |
-| Celery `visibility_timeout=360s` | Tasks from a dead worker are re-queued after 6 min (default was 1 hour) |
+| Celery `visibility_timeout=3900s` | Must exceed the worst-case scaled task runtime (up to 3660s for thesis-scale documents, see `app/tasks.py`), not the task's default decorator limits — a lower value re-queues tasks that are still legitimately running, causing duplicate execution of the same task_id |
 | Celery watchdog every 10s | Detects dead Celery process and restarts within 10s (was 30s) |
 | CitationDetector module singleton | Instantiated at import time, shared across all workers via CoW |
 | Result cache (sha256 keyed) | Same text + same plugins = 0ms from Redis cache, no re-inference |
@@ -2379,6 +2379,7 @@ Deep forensic analysis of why the container consumed **2.7 GB at baseline** and 
 | C-03 | `SoftTimeLimitExceeded` no capturado — con `--pool=threads` la excepción mataba el thread sin retornar error limpio | Añadido `except SoftTimeLimitExceeded` en `tasks.py` con respuesta de error estructurada |
 | C-04 | Watchdog del Celery worker chequeaba cada 30s — hasta 30s de tasks `PENDING` tras muerte del worker | Reducido a 10s en `gunicorn.conf.py` |
 | C-05 | `--pool=solo --concurrency=1` = 1 análisis a la vez, cuello de botella en servidores multi-core | Cambiado a `--pool=threads --concurrency=2` — 2 análisis simultáneos, PyTorch libera GIL durante inferencia C++ |
+| C-06 | `visibility_timeout=360s` (fix C-01) no daba cuenta del escalado por tamaño de documento en `time_limit`/`soft_time_limit` (hasta 3660s, ver `app/tasks.py`) — tasks aún vivas en documentos de unos pocos miles de palabras se marcaban como muertas y se reencolaban, corriendo la MISMA task_id dos veces en paralelo; la copia que terminaba último pisaba en Redis el resultado bueno de la otra | Subido a `3900s` en `celery_app.py` — por encima del peor caso real de duración, no del default de la decoración |
 
 ### Segmentación / Precisión del Análisis
 

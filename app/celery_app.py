@@ -24,14 +24,25 @@ def make_celery():
     celery.conf.task_acks_late = True
     # Prefetch 1 task at a time (important for memory-heavy ML tasks)
     celery.conf.worker_prefetch_multiplier = 1
-    # Re-queue unacknowledged tasks after 360s (slightly > time_limit=300).
+    # Re-queue unacknowledged tasks after 3900s — must exceed the WORST-CASE
+    # task runtime, not the default. analyze_document_task's time_limit/
+    # soft_time_limit are overridden per enqueue and scaled with word count
+    # (see app/tasks.py), up to CELERY_SOFT_TIME_LIMIT_CAP=3600s soft + 60s
+    # hard = 3660s for thesis-scale documents. The previous value here (360s)
+    # was sized for the task's DEFAULT decorator limits (time_limit=300) and
+    # never accounted for that per-enqueue scaling: any task still legitimately
+    # running past 360s (any document a few thousand words and up) got marked
+    # as dead and redelivered to another worker slot — duplicate execution of
+    # the same task_id, with whichever copy finishes LAST silently overwriting
+    # the other's result in the backend (seen in production: a fast/complete
+    # result clobbered by a slower duplicate whose ai_detection had timed out).
     # Default is 3600s (1 hour) — tasks from a dead worker would stay
     # PENDING for up to 1 hour before being retried.
     #
     # Fix #3: socket timeouts so a slow/dead Redis broker fails fast instead of
     # hanging the web request that calls .delay() (the "instant" async endpoint).
     celery.conf.broker_transport_options = {
-        'visibility_timeout': 360,
+        'visibility_timeout': 3900,
         'socket_timeout': 5,
         'socket_connect_timeout': 5,
     }
